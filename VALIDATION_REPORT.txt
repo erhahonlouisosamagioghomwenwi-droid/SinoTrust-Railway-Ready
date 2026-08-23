@@ -1,0 +1,31 @@
+SinoTrust Europe — Railway Ready validation
+Date: 2026-08-23
+
+PASS — Python syntax compilation (py_compile)
+PASS — FastAPI/Uvicorn production-style startup
+PASS — Log contains: INFO:     Application startup complete.
+PASS — GET / => HTTP 200
+PASS — GET /healthz => HTTP 200
+PASS — Commercial B2B request endpoint => HTTP 200 and persisted lead
+PASS — Invalid commercial request validation => HTTP 422
+PASS — Video 1 HEAD => HTTP 200, video/mp4, Accept-Ranges: bytes
+PASS — Video 1 Range seek => HTTP 206, exact 1 MiB range
+PASS — Video 2 HEAD => HTTP 200, video/mp4, Accept-Ranges: bytes
+PASS — Video 2 Range seek => HTTP 206, exact 1 MiB range
+PASS — Video 3 HEAD => HTTP 200, video/mp4, Accept-Ranges: bytes
+PASS — Video 3 Range seek => HTTP 206, exact 1 MiB range
+PASS — Video 3 360p/480p HEAD and Range requests
+PASS — Full ffmpeg decode check for all three original videos: no decode errors
+PASS — H.264 video + AAC audio confirmed on supplied originals
+PASS — MP4 fast-start confirmed: moov atom precedes mdat on all packaged video files
+PASS — B2B plan CTA labels present: Base / Professional / Enterprise
+PASS — Commercial API wiring present: /api/commercial-interest
+PASS — Railway start command binds FastAPI to 0.0.0.0:$PORT
+PASS — Railway healthcheck configured at /healthz
+PASS — Railway PostgreSQL compatibility: app accepts SINOTRUST_DATABASE_URL or DATABASE_URL
+
+Notes:
+- No payment checkout credentials are embedded. Public activation remains sales-led.
+- Subtitle tracks are optional in the existing player logic; no subtitle files were supplied for this packaging step.
+- Persistent production data should use Railway PostgreSQL rather than ephemeral local SQLite.
+- For a later high-traffic global rollout, videos should move to object storage/CDN; this package is suitable for the pilot/demo deployment and validation phase.
