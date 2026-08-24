@@ -485,7 +485,7 @@ SERVICE_TOKEN_TTL_DAYS = max(1, int(os.getenv("SINOTRUST_SERVICE_TOKEN_TTL_DAYS"
 CIRCUIT_BREAKER_FAILURE_THRESHOLD = max(1, int(os.getenv("SINOTRUST_CB_FAILURE_THRESHOLD", "5")))  
 CIRCUIT_BREAKER_RESET_SECONDS = max(5, int(os.getenv("SINOTRUST_CB_RESET_SECONDS", "60")))  
 SERVICE_AUDIENCE = os.getenv("SINOTRUST_SERVICE_AUDIENCE", "sinotrust-internal").strip() or "sinotrust-internal"  
-DATABASE_URL = os.getenv("SINOTRUST_DATABASE_URL", "").strip()  
+DATABASE_URL = os.getenv("SINOTRUST_DATABASE_URL", os.getenv("DATABASE_URL", "")).strip()  
 DATABASE_TARGET_ENGINE = (  
     "postgresql"  
     if DATABASE_URL.lower().startswith(("postgres://", "postgresql://"))  
@@ -1342,10 +1342,10 @@ class _PostgresConnectionCompat:
   
 def _postgres_dsn() -> str:  
     if not DATABASE_URL:  
-        raise RuntimeError("SINOTRUST_DATABASE_URL is required for PostgreSQL mode.")  
+        raise RuntimeError("DATABASE_URL (or SINOTRUST_DATABASE_URL) is required for PostgreSQL mode.")  
     parsed = urllib.parse.urlparse(DATABASE_URL)  
     if parsed.scheme not in {"postgres", "postgresql"}:  
-        raise RuntimeError("SINOTRUST_DATABASE_URL must use postgresql:// or postgres://")  
+        raise RuntimeError("DATABASE_URL (or SINOTRUST_DATABASE_URL) must use postgresql:// or postgres://")  
     return DATABASE_URL  
   
   
