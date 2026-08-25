@@ -3,6 +3,7 @@
 # SinoTrust_Production1.0Complete  
 # Livello 15  
 # SinoTrust Europe - Production 1.0 — Stage 4G  
+# Workspace Milestone 6 — session restoration, operation feedback, duplicate-safe company creation  
 # 4A→4G autonomous infrastructure hardening: PostgreSQL, object storage, Redis, AI, notifications, backup/observability, final validation.  
 # -*- coding: utf-8 -*-  
   
@@ -11722,8 +11723,9 @@ HTML_CONTENT = """<!DOCTYPE html>
     <section id="saasWorkspace">  
       <div class="saas-shell"><div class="saas-head"><div><h2>SinoTrust <b>Workspace</b></h2><p>Compliance operations, document review, verification and lifecycle.</p></div><button class="saas-btn gold" onclick="stRefresh()">Refresh workspace</button></div>  
       <div class="saas-grid">  
-        <div class="saas-card"><h4>Account</h4><input id="stEmail" placeholder="Email"><input id="stPass" type="password" placeholder="Password (8+ chars)"><button class="saas-btn" onclick="stAuth('register')">Register</button><button class="saas-btn" onclick="stAuth('login')">Login</button><button class="saas-btn" onclick="stLogout()">Logout</button><div id="stAuthStatus" class="saas-status"></div></div>  
-        <div class="saas-card"><h4>Company</h4><input id="stCompany" placeholder="Company name"><input id="stCountry" placeholder="Country"><input id="stReg" placeholder="Registration no."><button class="saas-btn" onclick="stCompanyCreate()">Save company</button></div>  
+        <div class="saas-card saas-wide"><div id="stWorkspaceStatus" class="saas-status" role="status" aria-live="polite">Checking session…</div></div>  
+        <div class="saas-card"><h4>Account</h4><input id="stEmail" placeholder="Email" autocomplete="email"><input id="stPass" type="password" placeholder="Password (10+ chars, letters + numbers)" autocomplete="current-password"><button class="saas-btn" onclick="stAuth('register')">Register</button><button class="saas-btn" onclick="stAuth('login')">Login</button><button class="saas-btn" onclick="stLogout()">Logout</button><div id="stAuthStatus" class="saas-status"></div></div>  
+        <div class="saas-card"><h4>Company</h4><input id="stCompany" placeholder="Company name"><input id="stCountry" placeholder="Country"><input id="stReg" placeholder="Registration no."><button id="stCompanyBtn" class="saas-btn" onclick="stCompanyCreate()">Save company</button><div id="stCompanyStatus" class="saas-status" role="status" aria-live="polite"></div></div>  
         <div class="saas-card"><h4>Product</h4><input id="stProduct" placeholder="Product name"><input id="stModel" placeholder="Model"><input id="stCategory" placeholder="Category"><button class="saas-btn" onclick="stProductCreate()">Add product</button></div>  
         <div class="saas-card"><h4>Compliance case</h4><select id="stPlan"><option value="base">Base ¥4,800</option><option value="professional">Professional ¥9,800</option><option value="enterprise">Enterprise ¥19,800</option></select><button class="saas-btn" onclick="stCaseCreate()">Create case</button><button class="saas-btn gold" onclick="stSubmitLatest()">Submit latest</button></div>  
         <div class="saas-card saas-wide"><h4>Documents & AI pre-review</h4><input id="stFile" type="file"><button class="saas-btn" onclick="stUpload()">Upload to latest case</button><button class="saas-btn" onclick="stAIReview()">Run AI pre-review</button><span class="saas-status">AI output is decision support for a human reviewer, not a legal certification.</span></div>  
@@ -11740,17 +11742,19 @@ HTML_CONTENT = """<!DOCTYPE html>
     function stEsc(value){return String(value??'').replace(/[&<>\"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[ch]))}  
     function stSafeId(value){const n=Number(value);return Number.isInteger(n)&&n>0?n:null}  
     function stSafeVerificationCode(value){const code=String(value??'').trim();return /^[A-Za-z0-9_-]{1,160}$/.test(code)?code:''}  
-    async function stApi(path,opt={}){opt.credentials='same-origin';opt.headers=Object.assign({},opt.headers||{});let r=await fetch(path,opt),d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||d.error||'Request failed');return d}  
-    async function stAuth(mode){try{let d=await stApi('/api/saas/'+mode,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:stEmail.value,password:stPass.value})});stAuthStatus.textContent='Authenticated: '+d.email;await stRefresh()}catch(e){stAuthStatus.textContent=e.message}}  
-    async function stLogout(){try{await stApi('/api/saas/logout',{method:'POST'});stLatestCase=null;stLatestProduct=null;stLatestCompany=null;stAuthStatus.textContent='Logged out';stData.textContent='Login to load your workspace.';stNotifications.textContent=''}catch(e){stAuthStatus.textContent=e.message}}  
-    async function stCompanyCreate(){try{let d=await stApi('/api/saas/companies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:stCompany.value,country:stCountry.value,registration_no:stReg.value})});stLatestCompany=d.id;stRefresh()}catch(e){alert(e.message)}}  
+    function stErrorMessage(d,status){if(typeof d?.detail==='string')return d.detail;if(typeof d?.error==='string')return d.error;if(Array.isArray(d?.detail)&&d.detail.length)return d.detail.map(x=>x?.msg||'Invalid value').join('; ');return 'Request failed ('+status+')'}  
+    function stSetWorkspaceStatus(message){if(stWorkspaceStatus)stWorkspaceStatus.textContent=message||''}  
+    async function stApi(path,opt={}){opt.credentials='same-origin';opt.headers=Object.assign({},opt.headers||{});let r=await fetch(path,opt),d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(stErrorMessage(d,r.status));return d}  
+    async function stAuth(mode){try{stSetWorkspaceStatus(mode==='login'?'Signing in…':'Creating account…');let d=await stApi('/api/saas/'+mode,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:stEmail.value,password:stPass.value})});stAuthStatus.textContent='Authenticated: '+d.email;stPass.value='';await stRefresh();stSetWorkspaceStatus('Workspace ready.')}catch(e){stAuthStatus.textContent=e.message;stSetWorkspaceStatus('Authentication failed: '+e.message)}}  
+    async function stLogout(){try{await stApi('/api/saas/logout',{method:'POST'});stLatestCase=null;stLatestProduct=null;stLatestCompany=null;stAuthStatus.textContent='Logged out';stData.textContent='Login to load your workspace.';stNotifications.textContent='';stSetWorkspaceStatus('Signed out.')}catch(e){stAuthStatus.textContent=e.message;stSetWorkspaceStatus(e.message)}}  
+    async function stCompanyCreate(){const name=stCompany.value.trim();if(!name){stCompanyStatus.textContent='Company name required.';stCompany.focus();return}const btn=stCompanyBtn;btn.disabled=true;stCompanyStatus.textContent='Saving…';try{let d=await stApi('/api/saas/companies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,country:stCountry.value.trim(),registration_no:stReg.value.trim()})});stLatestCompany=d.id;stCompanyStatus.textContent=d.duplicate?'Company already exists — existing record selected.':'Company saved successfully.';await stRefresh()}catch(e){stCompanyStatus.textContent=e.message}finally{btn.disabled=false}}  
     async function stProductCreate(){try{if(!stLatestCompany){let w=await stApi('/api/saas/workspace');stLatestCompany=w.companies?.[0]?.id}let d=await stApi('/api/saas/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:stLatestCompany,name:stProduct.value,model:stModel.value,category:stCategory.value})});stLatestProduct=d.id;stRefresh()}catch(e){alert(e.message)}}  
     async function stCaseCreate(){try{if(!stLatestProduct){let w=await stApi('/api/saas/workspace');stLatestProduct=w.products?.[0]?.id}let d=await stApi('/api/saas/cases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:stLatestProduct,plan:stPlan.value})});stLatestCase=d.id;stRefresh()}catch(e){alert(e.message)}}  
     async function stUpload(){try{if(!stLatestCase)await stRefresh();let f=stFile.files[0];if(!f)throw Error('Choose a file');let fd=new FormData();fd.append('file',f);await stApi('/api/saas/cases/'+stLatestCase+'/documents',{method:'POST',body:fd});stRefresh()}catch(e){alert(e.message)}}  
     async function stSubmitLatest(){try{if(!stLatestCase)await stRefresh();await stApi('/api/saas/cases/'+stLatestCase+'/submit',{method:'POST'});stRefresh()}catch(e){alert(e.message)}}  
     async function stAIReview(){try{if(!stLatestCase)await stRefresh();await stApi('/api/saas/cases/'+stLatestCase+'/ai-review',{method:'POST'});stRefresh()}catch(e){alert(e.message)}}  
     async function stPayment(){try{if(!stLatestCase)await stRefresh();let d=await stApi('/api/saas/cases/'+stLatestCase+'/payments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:stPayMethod.value})});if(d.checkout_url)location.href=d.checkout_url;else alert(d.message)}catch(e){alert(e.message)}}  
-    async function stRefresh(){try{let w=await stApi('/api/saas/workspace');stLatestCompany=w.companies?.[0]?.id||stLatestCompany;stLatestProduct=w.products?.[0]?.id||stLatestProduct;stLatestCase=w.cases?.[0]?.id||stLatestCase;stData.innerHTML=[...w.cases.map(x=>{const id=stSafeId(x.id),code=stSafeVerificationCode(x.verification_code);return `<div class="saas-item"><b>Case #${id??''}</b> — ${stEsc(x.product_name)} <span class="saas-pill">${stEsc(x.status)}</span> <span class="saas-pill">AI: ${stEsc(x.ai_status)}</span>${id&&code?` · <a href="/verify/${encodeURIComponent(code)}" target="_blank" rel="noopener noreferrer">Verify</a> · <a href="/api/saas/cases/${id}/certificate" target="_blank" rel="noopener noreferrer">PDF</a>`:''}</div>`}),...w.products.map(x=>`<div class="saas-item">Product: <b>${stEsc(x.name)}</b> ${stEsc(x.model||'')}</div>`)].join('')||'No records yet';stNotifications.innerHTML=w.notifications.map(n=>`<div class="saas-item"><b>${stEsc(n.title)}</b><br>${stEsc(n.body)}</div>`).join('')||'No notifications'}catch(e){stAuthStatus.textContent=e.message}}  
+    async function stRefresh(){try{stSetWorkspaceStatus('Refreshing workspace…');let w=await stApi('/api/saas/workspace');stLatestCompany=w.companies?.[0]?.id||stLatestCompany;stLatestProduct=w.products?.[0]?.id||stLatestProduct;stLatestCase=w.cases?.[0]?.id||stLatestCase;if(w.user?.email)stAuthStatus.textContent='Authenticated: '+w.user.email;stData.innerHTML=[...w.cases.map(x=>{const id=stSafeId(x.id),code=stSafeVerificationCode(x.verification_code);return `<div class="saas-item"><b>Case #${id??''}</b> — ${stEsc(x.product_name)} <span class="saas-pill">${stEsc(x.status)}</span> <span class="saas-pill">AI: ${stEsc(x.ai_status)}</span>${id&&code?` · <a href="/verify/${encodeURIComponent(code)}" target="_blank" rel="noopener noreferrer">Verify</a> · <a href="/api/saas/cases/${id}/certificate" target="_blank" rel="noopener noreferrer">PDF</a>`:''}</div>`}),...w.products.map(x=>`<div class="saas-item">Product: <b>${stEsc(x.name)}</b> ${stEsc(x.model||'')}</div>`)].join('')||'No records yet';stNotifications.innerHTML=w.notifications.map(n=>`<div class="saas-item"><b>${stEsc(n.title)}</b><br>${stEsc(n.body)}</div>`).join('')||'No notifications';stSetWorkspaceStatus('Workspace synchronized.')}catch(e){stAuthStatus.textContent=e.message==='authentication_required'?'Not authenticated.':e.message;stSetWorkspaceStatus(e.message==='authentication_required'?'Sign in to load your workspace.':'Workspace refresh failed: '+e.message)}}  
     async function stReviewerQueue(){try{let d=await stApi('/api/reviewer/cases');stReviewer.innerHTML=d.cases.map(c=>{const id=stSafeId(c.id);if(!id)return '';return `<div class="saas-item"><b>#${id} ${stEsc(c.company_name)} — ${stEsc(c.product_name)}</b> <span class="saas-pill">${stEsc(c.status)}</span><br>AI score: ${stEsc(c.ai_score??'n/a')}<br><button class="saas-btn" onclick="stReview(${id},'approve')">Approve</button><button class="saas-btn" onclick="stReview(${id},'reject')">Reject</button></div>`}).join('')}catch(e){alert(e.message)}}  
     async function stReview(id,decision){let notes=prompt('Reviewer notes:')||'';try{await stApi('/api/reviewer/cases/'+id+'/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,notes})});stReviewerQueue()}catch(e){alert(e.message)}}  
     document.addEventListener('DOMContentLoaded',()=>{stRefresh().catch(()=>{})});  
@@ -12057,26 +12061,53 @@ async def saas_company(payload: CompanyPayload, request: Request):
   
     locale = (payload.locale or DEFAULT_LOCALE).strip()[:20]  
   
+    clean_name = payload.name.strip()  
+    clean_country = payload.country.strip()  
+    clean_registration = payload.registration_no.strip()  
+    clean_website = payload.website.strip()  
+  
     with db_conn() as db:  
+        # Duplicate-safe create: identical company identity inside one organization  
+        # resolves to the existing record instead of producing repeated rows when a  
+        # browser retries or a user double-clicks the action.  
+        existing = db.execute(  
+            "SELECT id,data_region,locale FROM companies "  
+            "WHERE organization_id=? AND LOWER(TRIM(name))=? "  
+            "AND LOWER(TRIM(COALESCE(country,'')))=? "  
+            "AND LOWER(TRIM(COALESCE(registration_no,'')))=? "  
+            "ORDER BY id LIMIT 1",  
+            (org["id"],clean_name.casefold(),clean_country.casefold(),clean_registration.casefold()),  
+        ).fetchone()  
+        if existing:  
+            return {  
+                "id":existing["id"],  
+                "organization_id":org["id"],  
+                "data_region":existing["data_region"] or requested_region,  
+                "locale":existing["locale"] or locale,  
+                "created":False,  
+                "duplicate":True,  
+            }  
+  
         company_columns = {r[1] for r in db.execute("PRAGMA table_info(companies)")}  
+        now = iso_now()  
         if "company_name" in company_columns:  
             cur = db.execute(  
                 "INSERT INTO companies(user_id,organization_id,name,company_name,country,registration_no,registration_number,website,data_region,locale,created_at,updated_at) "  
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",  
-                (u["id"],org["id"],payload.name.strip(),payload.name.strip(),payload.country,payload.registration_no,payload.registration_no,payload.website,requested_region,locale,iso_now(),iso_now()),  
+                (u["id"],org["id"],clean_name,clean_name,clean_country,clean_registration,clean_registration,clean_website,requested_region,locale,now,now),  
             )  
         else:  
             cur = db.execute(  
                 "INSERT INTO companies(user_id,organization_id,name,country,registration_no,website,data_region,locale,created_at,updated_at) "  
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",  
-                (u["id"],org["id"],payload.name.strip(),payload.country,payload.registration_no,payload.website,requested_region,locale,iso_now(),iso_now()),  
+                (u["id"],org["id"],clean_name,clean_country,clean_registration,clean_website,requested_region,locale,now,now),  
             )  
         i = cur.lastrowid  
   
     audit(u["id"],"company_created","company",i,f"organization={org['id']};region={requested_region};locale={locale}")  
     meter_usage(org["id"],"companies",1,"company",i)  
-    queue_enterprise_event(org["id"],"company.created",{"company_id":i,"name":payload.name.strip(),"region":requested_region})  
-    return {"id":i,"organization_id":org["id"],"data_region":requested_region,"locale":locale}  
+    queue_enterprise_event(org["id"],"company.created",{"company_id":i,"name":clean_name,"region":requested_region})  
+    return {"id":i,"organization_id":org["id"],"data_region":requested_region,"locale":locale,"created":True,"duplicate":False}  
   
 @app.post("/api/saas/products", include_in_schema=False)  
 async def saas_product(payload: ProductPayload, request: Request):  
@@ -12360,6 +12391,7 @@ async def saas_workspace(request:Request):
         governance_row=db.execute("SELECT * FROM data_governance WHERE organization_id=?",(org['id'],)).fetchone()  
         organizations=[dict(x) for x in user_organizations(db,u['id'])]  
     return {  
+        "user":{"id":u["id"],"email":u["email"],"role":u["role"]},  
         "organization":org,  
         "organizations":organizations,  
         "members":members,  
