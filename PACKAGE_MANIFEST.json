@@ -1,0 +1,110 @@
+{
+  "package": "SinoTrust-Level100-GitHub-Browser-Ready",
+  "files": [
+    {
+      "path": ".env.example",
+      "size": 774,
+      "sha256": "93b9cd52e338e55c811e45fefe974c613b2892f423641395cf42af987f21a87a"
+    },
+    {
+      "path": ".github/workflows/validate.yml",
+      "size": 586,
+      "sha256": "58c1cc40650b29ba2f5aeed9706e237216eb2ffab1e3ed1a7e16c85b41658970"
+    },
+    {
+      "path": ".gitignore",
+      "size": 144,
+      "sha256": "3c350c9bd7c890e5520740469971a09e62602eb64f9c0c4ea12d182d4ed80778"
+    },
+    {
+      "path": ".python-version",
+      "size": 5,
+      "sha256": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d"
+    },
+    {
+      "path": "DEPLOYMENT_RAILWAY.md",
+      "size": 1785,
+      "sha256": "021d9b6ca0719fe062d3329f677a90e8e684ed685b9a60a6f0722c8c00798e86"
+    },
+    {
+      "path": "GITHUB_BROWSER_READY.txt",
+      "size": 679,
+      "sha256": "34b89daa976c9b5f14c7d655b7375afc3cf22451124771eddf7eb0a2bd269d6e"
+    },
+    {
+      "path": "README_RAILWAY.md",
+      "size": 1010,
+      "sha256": "d3d52d73e67e92bbba8852fabc594014e97e8045b0d3e8348c3ed0e7e066ef8e"
+    },
+    {
+      "path": "VALIDATION_REPORT.txt",
+      "size": 1892,
+      "sha256": "1a26f06203e4aed7f9d791670efcea382c624e05616c7d531d1c6f90e0e5f36f"
+    },
+    {
+      "path": "app.py",
+      "size": 755998,
+      "sha256": "8922867e796d0d20a2fc487d658a03fa9f4f4ce1928ba64028176ca1c9bfe043"
+    },
+    {
+      "path": "data/backups/.gitkeep",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "data/certificates/.gitkeep",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "data/exports/.gitkeep",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "data/uploads/.gitkeep",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "railway.json",
+      "size": 350,
+      "sha256": "87ad8fc09c8890975222cdf9226a8c56be1855663fd7326cdba682302eb07833"
+    },
+    {
+      "path": "requirements.txt",
+      "size": 420,
+      "sha256": "e2640633acb2a680e8dd57020d293ada0aecd1a32f8ffface1302f6c944de7a2"
+    },
+    {
+      "path": "static/subtitles/.gitkeep",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "static/videos/Sino_Presentationion.mp4",
+      "size": 23579451,
+      "sha256": "e7fbf0c110f42fa54177a7ff439cd3a2e46b51b2784d26ddff955ad8634186cf"
+    },
+    {
+      "path": "static/videos/Sino_abbonamenti_presentation.mp4",
+      "size": 25687817,
+      "sha256": "1d2591052aa3d2cab948744a8fb1c0c8317fb215ec2bd8a1356935ebe8001b9a"
+    },
+    {
+      "path": "static/videos/Sino_workspace_tutorial.mp4",
+      "size": 59399667,
+      "sha256": "e8fc5c006f9aef59666cf2cb46a4bab734112d4fbf56982f8deeab834e127ec4"
+    },
+    {
+      "path": "static/videos/Sino_workspace_tutorial_360p.mp4",
+      "size": 10201954,
+      "sha256": "12c2cad22cd617fe33c9cc59c9a3411c0fa81ee76788edf51ae05dad496f58cb"
+    },
+    {
+      "path": "static/videos/Sino_workspace_tutorial_480p.mp4",
+      "size": 13211593,
+      "sha256": "8992465842fdcb66c220e0426b99de49d5c5e6f00e19f19d22c0149439abcd6e"
+    }
+  ]
+}

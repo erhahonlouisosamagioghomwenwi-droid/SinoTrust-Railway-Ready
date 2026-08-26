@@ -1,0 +1,23 @@
+SinoTrust Level 100 — GitHub Browser Ready
+
+This package is reconstructed from the supplied SinoTrust-Railway-Ready-GitHub package.
+The application code in app.py has not been rewritten by this packaging step.
+
+GitHub browser upload:
+1. Open the repository root on GitHub.
+2. Choose Add file -> Upload files.
+3. Upload the CONTENTS of this folder (not the outer folder itself).
+4. Commit to main when ready.
+5. Railway can then deploy from the repository according to railway.json.
+
+Core deployment files:
+- app.py
+- requirements.txt
+- railway.json
+- .python-version
+- .env.example
+- README_RAILWAY.md
+- DEPLOYMENT_RAILWAY.md
+- static/
+- data/
+- .github/workflows/validate.yml

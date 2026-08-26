@@ -467,7 +467,17 @@ REDIS_FAIL_CLOSED = os.getenv(
     "SINOTRUST_REDIS_FAIL_CLOSED",
     "1" if (APP_ENV == "production" and IS_LIVE_MODE) else "0",
 ) == "1"
-OBJECT_STORAGE_MODE = os.getenv("SINOTRUST_OBJECT_STORAGE", "local").strip().lower()
+# Prefer an explicit SinoTrust setting, but automatically activate S3 when a
+# Railway Bucket (or another S3-compatible provider) injects bucket variables.
+# This keeps local development on filesystem storage while making production
+# deployments use the real object store without requiring a redundant toggle.
+_OBJECT_STORAGE_EXPLICIT = os.getenv("SINOTRUST_OBJECT_STORAGE", "").strip().lower()
+_OBJECT_STORAGE_BUCKET_HINT = bool(
+    os.getenv("SINOTRUST_S3_BUCKET", "").strip()
+    or os.getenv("AWS_S3_BUCKET_NAME", "").strip()
+    or os.getenv("BUCKET", "").strip()
+)
+OBJECT_STORAGE_MODE = _OBJECT_STORAGE_EXPLICIT or ("s3" if _OBJECT_STORAGE_BUCKET_HINT else "local")
 if OBJECT_STORAGE_MODE not in {"local", "s3"}:
     raise RuntimeError("SINOTRUST_OBJECT_STORAGE must be either 'local' or 's3'.")
 S3_BUCKET = os.getenv("SINOTRUST_S3_BUCKET", os.getenv("AWS_S3_BUCKET_NAME", os.getenv("BUCKET", ""))).strip()
