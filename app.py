@@ -1,4 +1,4 @@
-#   
+  
 # SinoTrust_GlobalFinal pt.2  
 # SinoTrust_GlobalFinal  
 # SinoTrust_Production1.0Complete  
@@ -490,6 +490,11 @@ ENTERPRISE_SIGNING_SECRET = os.getenv("SINOTRUST_SIGNING_SECRET", "").strip()
 # Dedicated machine-to-machine credential for the private Prometheus scrape endpoint.  
 # Keep this secret in the runtime environment (Railway Variables); never hard-code it.  
 METRICS_TOKEN = os.getenv("SINOTRUST_METRICS_TOKEN", "").strip()  
+  
+# Optional, isolated credential for the deliberate 5xx observability probe.  
+# The endpoint remains disabled unless this secret is configured explicitly.  
+# Never hard-code the value or place it in a URL/query string.  
+TEST_5XX_TOKEN = os.getenv("SINOTRUST_TEST_5XX_TOKEN", "").strip()  
   
 # Level 7 cloud-native operations configuration.  
 # All external services are OPTIONAL in local development; the platform  
@@ -13481,6 +13486,25 @@ async def metrics(x_metrics_token: Optional[str] = Header(default=None)):
         f"sinotrust_request_duration_ms_average {avg_ms:.3f}",  
     ]  
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")  
+  
+  
+@app.post("/api/internal/test-5xx", include_in_schema=False)  
+async def internal_test_5xx(x_test_token: Optional[str] = Header(default=None)):  
+    """Deliberately raise one 500 error to verify production observability.  
+  
+    Disabled by default. Enable only by configuring SINOTRUST_TEST_5XX_TOKEN and  
+    send the same value in the X-Test-Token header. The token is never accepted  
+    through the URL, keeping it out of normal access logs and browser history.  
+    """  
+    if not TEST_5XX_TOKEN:  
+        return JSONResponse({"error":"test_5xx_not_configured"}, status_code=404)  
+  
+    provided_token = (x_test_token or "").strip()  
+    if not provided_token or not secrets.compare_digest(provided_token, TEST_5XX_TOKEN):  
+        return JSONResponse({"error":"test_5xx_unauthorized"}, status_code=401)  
+  
+    raise RuntimeError("sinotrust_deliberate_observability_test_5xx")  
+  
   
 @app.post("/api/admin/backup", include_in_schema=False)  
 async def admin_backup(request: Request, x_reviewer_key: Optional[str] = Header(default=None)):  
