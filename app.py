@@ -3556,6 +3556,190 @@ def deliver_notification_outbox(outbox_id: int):
             return False  
         raise  
   
+  
+# ============================================================  
+# SINOTRUST NOTIFICATION GATEWAY — SIGNED INTERNAL INGEST  
+# ============================================================  
+# This endpoint is intentionally provider-neutral. The main SinoTrust service  
+# POSTs notification-outbox events here using the same HMAC-SHA256 contract  
+# already implemented by deliver_notification_outbox(). The gateway validates  
+# authenticity, input shape and idempotency before accepting the event.  
+#  
+# IMPORTANT: a 2xx response means "accepted by the SinoTrust notification  
+# gateway", not "delivered to the final mailbox". A downstream email/SMS  
+# provider can be attached later without changing the caller contract.  
+NOTIFICATION_GATEWAY_MAX_BODY_BYTES = max(  
+    4096,  
+    min(1024 * 1024, int(os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_MAX_BODY_BYTES", str(256 * 1024)))),  
+)  
+NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS = max(  
+    300,  
+    min(30 * 24 * 3600, int(os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS", str(7 * 24 * 3600)))),  
+)  
+_NOTIFICATION_GATEWAY_LOCAL_IDS = {}  
+  
+  
+def _notification_gateway_provider_ref(notification_id: str) -> str:  
+    """Return a deterministic, non-secret acceptance reference."""  
+    digest = hashlib.sha256(f"sinotrust-notification:{notification_id}".encode("utf-8")).hexdigest()[:24]  
+    return f"STN-{digest.upper()}"  
+  
+  
+def _notification_gateway_mark_once(notification_id: str) -> tuple[bool, str]:  
+    """Return (first_seen, provider_ref), using Redis when available.  
+  
+    The deterministic provider reference makes duplicate retries idempotent even  
+    when the process restarts. Redis, when configured, additionally provides a  
+    shared duplicate gate across Railway replicas.  
+    """  
+    provider_ref = _notification_gateway_provider_ref(notification_id)  
+    redis_client = _redis_client()  
+    if redis_client is not None:  
+        try:  
+            key = f"sinotrust:notification-gateway:idempotency:{notification_id}"  
+            created = bool(  
+                redis_client.set(  
+                    key,  
+                    provider_ref,  
+                    nx=True,  
+                    ex=NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS,  
+                )  
+            )  
+            existing = redis_client.get(key) or provider_ref  
+            return created, str(existing)  
+        except Exception as exc:  
+            logger.warning("notification_gateway_idempotency_redis_failed: %s", exc)  
+  
+    # Safe process-local fallback. It is bounded by TTL cleanup and preserves  
+    # idempotency within one replica when Redis is temporarily unavailable.  
+    now = time.monotonic()  
+    stale_before = now - NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS  
+    if len(_NOTIFICATION_GATEWAY_LOCAL_IDS) > 4096:  
+        for key, seen_at in list(_NOTIFICATION_GATEWAY_LOCAL_IDS.items()):  
+            if seen_at < stale_before:  
+                _NOTIFICATION_GATEWAY_LOCAL_IDS.pop(key, None)  
+    first_seen = notification_id not in _NOTIFICATION_GATEWAY_LOCAL_IDS  
+    _NOTIFICATION_GATEWAY_LOCAL_IDS[notification_id] = now  
+    return first_seen, provider_ref  
+  
+  
+@app.post("/api/internal/notification-gateway", include_in_schema=False)  
+async def sinotrust_notification_gateway_ingest(  
+    request: Request,  
+    x_sinotrust_signature: Optional[str] = Header(default=None),  
+    x_sinotrust_notification_id: Optional[str] = Header(default=None),  
+):  
+    """Receive a signed SinoTrust notification-outbox event.  
+  
+    Security contract:  
+    - requires SINOTRUST_NOTIFICATION_GATEWAY_SECRET;  
+    - verifies HMAC-SHA256 over the exact raw request body;  
+    - rejects oversized, malformed or semantically invalid payloads;  
+    - treats duplicate notification IDs idempotently;  
+    - never returns or logs the shared secret or message body.  
+    """  
+    if not NOTIFICATION_GATEWAY_SECRET:  
+        return JSONResponse(  
+            {"error": "notification_gateway_secret_not_configured"},  
+            status_code=503,  
+        )  
+  
+    content_length = request.headers.get("content-length", "").strip()  
+    if content_length:  
+        try:  
+            if int(content_length) > NOTIFICATION_GATEWAY_MAX_BODY_BYTES:  
+                return JSONResponse({"error": "payload_too_large"}, status_code=413)  
+        except ValueError:  
+            return JSONResponse({"error": "invalid_content_length"}, status_code=400)  
+  
+    body = await request.body()  
+    if not body:  
+        return JSONResponse({"error": "empty_payload"}, status_code=400)  
+    if len(body) > NOTIFICATION_GATEWAY_MAX_BODY_BYTES:  
+        return JSONResponse({"error": "payload_too_large"}, status_code=413)  
+  
+    supplied_signature = (x_sinotrust_signature or "").strip().lower()  
+    if not re.fullmatch(r"[0-9a-f]{64}", supplied_signature):  
+        return JSONResponse({"error": "invalid_signature"}, status_code=401)  
+  
+    expected_signature = hmac.new(  
+        NOTIFICATION_GATEWAY_SECRET.encode("utf-8"),  
+        body,  
+        hashlib.sha256,  
+    ).hexdigest()  
+    if not hmac.compare_digest(expected_signature, supplied_signature):  
+        return JSONResponse({"error": "invalid_signature"}, status_code=401)  
+  
+    try:  
+        payload = json.loads(body)  
+    except (json.JSONDecodeError, UnicodeDecodeError):  
+        return JSONResponse({"error": "invalid_json"}, status_code=400)  
+    if not isinstance(payload, dict):  
+        return JSONResponse({"error": "invalid_payload"}, status_code=422)  
+  
+    raw_id = payload.get("id")  
+    notification_id = str(raw_id).strip() if raw_id is not None else ""  
+    header_notification_id = (x_sinotrust_notification_id or "").strip()  
+    if not notification_id or len(notification_id) > 128:  
+        return JSONResponse({"error": "invalid_notification_id"}, status_code=422)  
+    if header_notification_id and not hmac.compare_digest(header_notification_id, notification_id):  
+        return JSONResponse({"error": "notification_id_mismatch"}, status_code=422)  
+  
+    channel = str(payload.get("channel") or "").strip().lower()  
+    destination = str(payload.get("destination") or "").strip()  
+    template = str(payload.get("template") or "").strip()  
+    data = payload.get("data")  
+  
+    if channel not in {"email"}:  
+        return JSONResponse({"error": "unsupported_notification_channel"}, status_code=422)  
+    if not destination or len(destination) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", destination):  
+        return JSONResponse({"error": "invalid_notification_destination"}, status_code=422)  
+    if not template or len(template) > 120 or not re.fullmatch(r"[A-Za-z0-9_.-]+", template):  
+        return JSONResponse({"error": "invalid_notification_template"}, status_code=422)  
+    if not isinstance(data, dict):  
+        return JSONResponse({"error": "invalid_notification_data"}, status_code=422)  
+  
+    title = str(data.get("title") or "").strip()  
+    message_body = str(data.get("body") or "").strip()  
+    locale = str(data.get("locale") or "auto").strip()[:20] or "auto"  
+    if not title or len(title) > 300:  
+        return JSONResponse({"error": "invalid_notification_title"}, status_code=422)  
+    if not message_body or len(message_body) > 10000:  
+        return JSONResponse({"error": "invalid_notification_body"}, status_code=422)  
+  
+    first_seen, provider_ref = _notification_gateway_mark_once(notification_id)  
+  
+    logger.info(  
+        json.dumps(  
+            {  
+                "event": "notification_gateway_accepted",  
+                "notification_id": notification_id,  
+                "provider_ref": provider_ref,  
+                "channel": channel,  
+                "template": template,  
+                "locale": locale,  
+                "duplicate": not first_seen,  
+            },  
+            ensure_ascii=False,  
+        )  
+    )  
+  
+    return JSONResponse(  
+        {  
+            "ok": True,  
+            "accepted": True,  
+            "duplicate": not first_seen,  
+            "notification_id": notification_id,  
+            "provider_reference": provider_ref,  
+        },  
+        status_code=202,  
+        headers={  
+            "X-Provider-Reference": provider_ref,  
+            "Cache-Control": "no-store",  
+        },  
+    )  
+  
+  
 async def execute_background_job(job: dict):  
     payload = json.loads(job.get("payload_json") or "{}")  
     job_type = job.get("job_type")  
