@@ -1,4 +1,3 @@
-  
 # SinoTrust_GlobalFinal pt.2  
 # SinoTrust_GlobalFinal  
 # SinoTrust_Production1.0Complete  
