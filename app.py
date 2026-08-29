@@ -1,4 +1,3 @@
-  
 # SinoTrust_GlobalFinal pt.2  
 # SinoTrust_GlobalFinal  
 # SinoTrust_Production1.0Complete  
@@ -198,10 +197,19 @@ def _client_ip(request: Request) -> str:
     return str(peer) if peer is not None else "unknown"  
   
 def _effective_request_scheme(request: Request) -> str:  
-    if _request_from_trusted_proxy(request):  
-        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()  
-        if proto in {"http", "https"}:  
-            return proto  
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()  
+  
+    # Railway terminates TLS at its edge proxy and forwards the request  
+    # internally over HTTP. When running inside Railway, honor the platform's  
+    # forwarded protocol so an HTTPS request is not redirected to itself.  
+    if os.getenv("RAILWAY_ENVIRONMENT_ID", "").strip() and proto in {"http", "https"}:  
+        return proto  
+  
+    # Outside Railway, forwarding headers remain restricted to explicitly  
+    # trusted proxies.  
+    if _request_from_trusted_proxy(request) and proto in {"http", "https"}:  
+        return proto  
+  
     return request.url.scheme.lower()  
   
 def _effective_request_host(request: Request) -> str:  
