@@ -16420,6 +16420,19 @@ PRODUCTION_STRICT_EXTERNALS = os.getenv("SINOTRUST_PRODUCTION_STRICT_EXTERNALS",
 PAYMENT_GATEWAY_TIMEOUT = max(3, int(os.getenv("SINOTRUST_PAYMENT_GATEWAY_TIMEOUT", "15")))  
 PAYMENT_GATEWAY_API_KEY = os.getenv("SINOTRUST_PAYMENT_GATEWAY_API_KEY", "").strip()  
 PAYMENT_GATEWAY_MODE = os.getenv("SINOTRUST_PAYMENT_GATEWAY_MODE", "http-json").strip().lower() or "http-json"  
+  
+# Stripe-backed SinoTrust payment adapter. These secrets belong only on the  
+# gateway service that talks to Stripe; the main web service must never receive  
+# STRIPE_SECRET_KEY.  
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()  
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()  
+STRIPE_API_BASE = os.getenv("STRIPE_API_BASE", "https://api.stripe.com").strip().rstrip("/") or "https://api.stripe.com"  
+STRIPE_GATEWAY_TIMEOUT = max(3, int(os.getenv("SINOTRUST_STRIPE_TIMEOUT", "20")))  
+STRIPE_WEBHOOK_TOLERANCE_SECONDS = max(60, min(900, int(os.getenv("SINOTRUST_STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))))  
+STRIPE_GATEWAY_MAX_BODY_BYTES = max(  
+    4096,  
+    min(256 * 1024, int(os.getenv("SINOTRUST_PAYMENT_GATEWAY_MAX_BODY_BYTES", str(64 * 1024)))),  
+)  
 BACKUP_REQUIRED = os.getenv("SINOTRUST_BACKUP_REQUIRED", "1" if (APP_ENV == "production" and IS_LIVE_MODE) else "0") == "1"  
 MANAGED_DATABASE_BACKUPS = os.getenv("SINOTRUST_MANAGED_DATABASE_BACKUPS", "0") == "1"  
 MANAGED_BACKUP_PROVIDER = os.getenv("SINOTRUST_MANAGED_BACKUP_PROVIDER", "").strip()  
@@ -16844,6 +16857,415 @@ def create_payment_checkout_request(case_id: int, amount: int, method: str, refe
         "checkout_url": checkout_url,  
         "reference": str(payload.get("reference") or reference),  
     }  
+  
+  
+# ============================================================  
+# SINOTRUST PAYMENT GATEWAY — STRIPE CHECKOUT ADAPTER  
+# ============================================================  
+# This endpoint is intentionally deployed from the same codebase as the  
+# notification gateway, but it is inert unless STRIPE_SECRET_KEY is configured.  
+# The main SinoTrust service never receives the Stripe secret. Instead it sends  
+# a signed/authenticated provider-neutral JSON request to this adapter.  
+#  
+# Contract accepted from create_payment_checkout_request():  
+#   reference, case_id, amount, currency, method, return_url, webhook_url  
+# Contract returned:  
+#   checkout_url, reference, provider  
+#  
+# Stripe API calls use urllib from the standard library so no additional Python  
+# package is required in Railway.  
+  
+def _payment_gateway_bearer_token(request: Request) -> str:  
+    raw = request.headers.get("authorization", "").strip()  
+    if not raw.lower().startswith("bearer "):  
+        return ""  
+    return raw[7:].strip()  
+  
+  
+def _payment_gateway_verify_caller(request: Request, body: bytes) -> Optional[JSONResponse]:  
+    """Authenticate the main SinoTrust service before any Stripe operation."""  
+    if not PAYMENT_GATEWAY_API_KEY:  
+        return JSONResponse({"error": "payment_gateway_api_key_not_configured"}, status_code=503)  
+  
+    supplied = _payment_gateway_bearer_token(request)  
+    if not supplied or not hmac.compare_digest(supplied, PAYMENT_GATEWAY_API_KEY):  
+        return JSONResponse({"error": "payment_gateway_unauthorized"}, status_code=401)  
+  
+    signing_secret = os.getenv("SINOTRUST_PAYMENT_GATEWAY_SIGNING_SECRET", "").strip()  
+    if signing_secret:  
+        supplied_signature = request.headers.get("x-sinotrust-signature", "").strip().lower()  
+        if not re.fullmatch(r"[0-9a-f]{64}", supplied_signature):  
+            return JSONResponse({"error": "payment_gateway_invalid_signature"}, status_code=401)  
+        expected_signature = hmac.new(  
+            signing_secret.encode("utf-8"),  
+            body,  
+            hashlib.sha256,  
+        ).hexdigest()  
+        if not hmac.compare_digest(expected_signature, supplied_signature):  
+            return JSONResponse({"error": "payment_gateway_invalid_signature"}, status_code=401)  
+    return None  
+  
+  
+def _stripe_minor_unit_amount(amount: int, currency: str) -> int:  
+    """Convert SinoTrust whole-currency amounts to Stripe minor units."""  
+    currency = (currency or "").strip().lower()  
+    zero_decimal = {  
+        "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga",  
+        "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf",  
+    }  
+    multiplier = 1 if currency in zero_decimal else 100  
+    value = int(amount) * multiplier  
+    if value <= 0:  
+        raise ValueError("invalid_payment_amount")  
+    # Defensive upper bound; normal SinoTrust plan prices are far below this.  
+    if value > 99999999999:  
+        raise ValueError("payment_amount_too_large")  
+    return value  
+  
+  
+def _stripe_method_parameters(method: str) -> dict[str, str]:  
+    normalized = (method or "").strip().lower().replace("-", "_")  
+    aliases = {  
+        "wechat": "wechat_pay",  
+        "weixin": "wechat_pay",  
+        "wechatpay": "wechat_pay",  
+        "wechat_pay": "wechat_pay",  
+        "alipay": "alipay",  
+        "card": "card",  
+        "cards": "card",  
+    }  
+    stripe_method = aliases.get(normalized)  
+    if stripe_method is None:  
+        raise ValueError("unsupported_payment_method")  
+  
+    params = {"payment_method_types[0]": stripe_method}  
+    if stripe_method == "wechat_pay":  
+        # Stripe requires the client type when WeChat Pay is listed manually.  
+        params["payment_method_options[wechat_pay][client]"] = "web"  
+    return params  
+  
+  
+def _stripe_api_post(path: str, params: dict[str, object], *, idempotency_key: str = "") -> dict:  
+    if not STRIPE_SECRET_KEY:  
+        raise RuntimeError("stripe_secret_key_not_configured")  
+    if not STRIPE_API_BASE.lower().startswith("https://"):  
+        raise RuntimeError("stripe_api_base_must_use_https")  
+  
+    encoded = urllib.parse.urlencode(params, doseq=True).encode("utf-8")  
+    headers = {  
+        "Authorization": f"Bearer {STRIPE_SECRET_KEY}",  
+        "Content-Type": "application/x-www-form-urlencoded",  
+        "Accept": "application/json",  
+        "User-Agent": "SinoTrust-Stripe-Gateway/1.0",  
+    }  
+    if idempotency_key:  
+        headers["Idempotency-Key"] = idempotency_key[:255]  
+  
+    req = urllib.request.Request(  
+        f"{STRIPE_API_BASE}/{path.lstrip('/')}",  
+        data=encoded,  
+        headers=headers,  
+        method="POST",  
+    )  
+    try:  
+        with urllib.request.urlopen(req, timeout=STRIPE_GATEWAY_TIMEOUT) as response:  
+            status = int(getattr(response, "status", 200))  
+            raw = response.read()  
+    except urllib.error.HTTPError as exc:  
+        raw = exc.read()  
+        try:  
+            detail = json.loads(raw.decode("utf-8") or "{}")  
+            message = str((detail.get("error") or {}).get("message") or f"stripe_http_{exc.code}")[:300]  
+        except Exception:  
+            message = f"stripe_http_{exc.code}"  
+        raise RuntimeError(message) from exc  
+    except urllib.error.URLError as exc:  
+        raise RuntimeError("stripe_network_unavailable") from exc  
+  
+    if not 200 <= status < 300:  
+        raise RuntimeError(f"stripe_http_{status}")  
+    try:  
+        payload = json.loads(raw.decode("utf-8") or "{}")  
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:  
+        raise RuntimeError("stripe_invalid_json_response") from exc  
+    if not isinstance(payload, dict):  
+        raise RuntimeError("stripe_invalid_response")  
+    return payload  
+  
+  
+def _append_query(url: str, **values: str) -> str:  
+    parsed = urllib.parse.urlparse(url)  
+    existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)  
+    existing.extend((k, v) for k, v in values.items())  
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(existing)))  
+  
+  
+def _validated_https_callback(url: str, field: str) -> str:  
+    value = (url or "").strip()  
+    parsed = urllib.parse.urlparse(value)  
+    if parsed.scheme.lower() != "https" or not parsed.hostname:  
+        raise ValueError(f"invalid_{field}")  
+    if parsed.username or parsed.password:  
+        raise ValueError(f"invalid_{field}")  
+    return value  
+  
+  
+@app.post("/api/internal/payment-gateway", include_in_schema=False)  
+async def sinotrust_payment_gateway_checkout(request: Request):  
+    """Create a Stripe-hosted Checkout Session for an authenticated SinoTrust request."""  
+    if not STRIPE_SECRET_KEY:  
+        return JSONResponse({"error": "stripe_gateway_not_configured"}, status_code=503)  
+  
+    content_length = request.headers.get("content-length", "").strip()  
+    if content_length:  
+        try:  
+            if int(content_length) > STRIPE_GATEWAY_MAX_BODY_BYTES:  
+                return JSONResponse({"error": "payload_too_large"}, status_code=413)  
+        except ValueError:  
+            return JSONResponse({"error": "invalid_content_length"}, status_code=400)  
+  
+    body = await request.body()  
+    if not body:  
+        return JSONResponse({"error": "empty_payload"}, status_code=400)  
+    if len(body) > STRIPE_GATEWAY_MAX_BODY_BYTES:  
+        return JSONResponse({"error": "payload_too_large"}, status_code=413)  
+  
+    auth_error = _payment_gateway_verify_caller(request, body)  
+    if auth_error is not None:  
+        return auth_error  
+  
+    try:  
+        payload = json.loads(body)  
+    except (json.JSONDecodeError, UnicodeDecodeError):  
+        return JSONResponse({"error": "invalid_json"}, status_code=400)  
+    if not isinstance(payload, dict):  
+        return JSONResponse({"error": "invalid_payload"}, status_code=422)  
+  
+    try:  
+        reference = str(payload.get("reference") or "").strip()  
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", reference):  
+            raise ValueError("invalid_reference")  
+  
+        case_id = int(payload.get("case_id"))  
+        amount = int(payload.get("amount"))  
+        if case_id <= 0 or amount <= 0:  
+            raise ValueError("invalid_case_or_amount")  
+  
+        currency = str(payload.get("currency") or "CNY").strip().lower()  
+        if not re.fullmatch(r"[a-z]{3}", currency):  
+            raise ValueError("invalid_currency")  
+  
+        method = str(payload.get("method") or "alipay").strip()  
+        return_url = _validated_https_callback(str(payload.get("return_url") or ""), "return_url")  
+        webhook_url = _validated_https_callback(str(payload.get("webhook_url") or ""), "webhook_url")  
+  
+        unit_amount = _stripe_minor_unit_amount(amount, currency)  
+        method_params = _stripe_method_parameters(method)  
+    except (TypeError, ValueError) as exc:  
+        return JSONResponse({"error": str(exc)[:120]}, status_code=422)  
+  
+    # Stripe replaces {CHECKOUT_SESSION_ID} in hosted Checkout success URLs.  
+    success_url = _append_query(  
+        return_url,  
+        payment="success",  
+        session_id="{CHECKOUT_SESSION_ID}",  
+        reference=reference,  
+    )  
+    cancel_url = _append_query(return_url, payment="cancelled", reference=reference)  
+  
+    params: dict[str, object] = {  
+        "mode": "payment",  
+        "success_url": success_url,  
+        "cancel_url": cancel_url,  
+        "client_reference_id": reference,  
+        "line_items[0][price_data][currency]": currency,  
+        "line_items[0][price_data][product_data][name]": "SinoTrust Europe service",  
+        "line_items[0][price_data][product_data][description]": f"SinoTrust case {case_id}",  
+        "line_items[0][price_data][unit_amount]": str(unit_amount),  
+        "line_items[0][quantity]": "1",  
+        "metadata[reference]": reference,  
+        "metadata[case_id]": str(case_id),  
+        "metadata[webhook_url]": webhook_url,  
+        "metadata[requested_method]": method,  
+        "payment_intent_data[metadata][reference]": reference,  
+        "payment_intent_data[metadata][case_id]": str(case_id),  
+        "payment_intent_data[metadata][webhook_url]": webhook_url,  
+        "payment_intent_data[metadata][requested_method]": method,  
+    }  
+    params.update(method_params)  
+  
+    try:  
+        stripe_session = await asyncio.to_thread(  
+            _stripe_api_post,  
+            "/v1/checkout/sessions",  
+            params,  
+            idempotency_key=reference,  
+        )  
+    except Exception as exc:  
+        logger.exception("stripe_checkout_create_failed")  
+        return JSONResponse(  
+            {"error": "stripe_checkout_unavailable", "detail": str(exc)[:300]},  
+            status_code=502,  
+        )  
+  
+    checkout_url = str(stripe_session.get("url") or "").strip()  
+    session_id = str(stripe_session.get("id") or "").strip()  
+    if not checkout_url.startswith("https://checkout.stripe.com/"):  
+        return JSONResponse({"error": "stripe_missing_checkout_url"}, status_code=502)  
+  
+    return {  
+        "checkout_url": checkout_url,  
+        "reference": reference,  
+        "provider": "stripe",  
+        "provider_session_id": session_id,  
+        "livemode": bool(stripe_session.get("livemode", False)),  
+    }  
+  
+  
+def _verify_stripe_webhook_signature(body: bytes, signature_header: str) -> bool:  
+    """Verify Stripe's t=...,v1=... webhook HMAC using the raw request body."""  
+    if not STRIPE_WEBHOOK_SECRET or not signature_header:  
+        return False  
+  
+    timestamp = None  
+    signatures = []  
+    for part in signature_header.split(","):  
+        key, sep, value = part.strip().partition("=")  
+        if not sep:  
+            continue  
+        if key == "t" and value.isdigit():  
+            timestamp = int(value)  
+        elif key == "v1" and re.fullmatch(r"[0-9a-fA-F]{64}", value or ""):  
+            signatures.append(value.lower())  
+  
+    if timestamp is None or not signatures:  
+        return False  
+    if abs(int(time.time()) - timestamp) > STRIPE_WEBHOOK_TOLERANCE_SECONDS:  
+        return False  
+  
+    signed_payload = str(timestamp).encode("ascii") + b"." + body  
+    expected = hmac.new(  
+        STRIPE_WEBHOOK_SECRET.encode("utf-8"),  
+        signed_payload,  
+        hashlib.sha256,  
+    ).hexdigest()  
+    return any(hmac.compare_digest(expected, candidate) for candidate in signatures)  
+  
+  
+def _stripe_event_to_sinotrust_status(event: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:  
+    """Return (reference, status, callback_url) for events relevant to SinoTrust."""  
+    event_type = str(event.get("type") or "")  
+    obj = ((event.get("data") or {}).get("object") or {})  
+    if not isinstance(obj, dict):  
+        return None, None, None  
+    metadata = obj.get("metadata") or {}  
+    if not isinstance(metadata, dict):  
+        metadata = {}  
+  
+    reference = str(metadata.get("reference") or obj.get("client_reference_id") or "").strip()  
+    callback_url = str(metadata.get("webhook_url") or "").strip()  
+  
+    status = None  
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:  
+        if event_type == "checkout.session.completed" and str(obj.get("payment_status") or "") not in {"paid", "no_payment_required"}:  
+            return reference or None, None, callback_url or None  
+        status = "paid"  
+    elif event_type in {"checkout.session.async_payment_failed", "checkout.session.expired", "payment_intent.payment_failed"}:  
+        status = "failed"  
+  
+    return reference or None, status, callback_url or None  
+  
+  
+def _forward_payment_status_to_sinotrust(callback_url: str, reference: str, status: str, event_id: str) -> None:  
+    secret = os.getenv("SINOTRUST_PAYMENT_WEBHOOK_SECRET", "").strip()  
+    if not secret:  
+        raise RuntimeError("sinotrust_payment_webhook_secret_not_configured")  
+    callback = _validated_https_callback(callback_url, "payment_webhook_url")  
+  
+    payload = json.dumps(  
+        {  
+            "reference": reference,  
+            "status": status,  
+            "event_id": event_id,  
+            "provider": "stripe",  
+        },  
+        separators=(",", ":"),  
+        ensure_ascii=False,  
+    ).encode("utf-8")  
+    signature = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()  
+    req = urllib.request.Request(  
+        callback,  
+        data=payload,  
+        headers={  
+            "Content-Type": "application/json",  
+            "Accept": "application/json",  
+            "User-Agent": "SinoTrust-Stripe-Gateway/1.0",  
+            "X-SinoTrust-Signature": signature,  
+        },  
+        method="POST",  
+    )  
+    try:  
+        with urllib.request.urlopen(req, timeout=PAYMENT_GATEWAY_TIMEOUT) as response:  
+            status_code = int(getattr(response, "status", 200))  
+            response.read(4096)  
+    except urllib.error.HTTPError as exc:  
+        exc.read(4096)  
+        raise RuntimeError(f"sinotrust_payment_webhook_http_{exc.code}") from exc  
+    except urllib.error.URLError as exc:  
+        raise RuntimeError("sinotrust_payment_webhook_unreachable") from exc  
+    if not 200 <= status_code < 300:  
+        raise RuntimeError(f"sinotrust_payment_webhook_http_{status_code}")  
+  
+  
+@app.post("/api/internal/payment-gateway/stripe-webhook", include_in_schema=False)  
+async def sinotrust_stripe_webhook(  
+    request: Request,  
+    stripe_signature: Optional[str] = Header(default=None, alias="Stripe-Signature"),  
+):  
+    """Verify Stripe events and forward normalized payment status to SinoTrust."""  
+    if not STRIPE_WEBHOOK_SECRET:  
+        return JSONResponse({"error": "stripe_webhook_secret_not_configured"}, status_code=503)  
+  
+    body = await request.body()  
+    if not body or len(body) > STRIPE_GATEWAY_MAX_BODY_BYTES:  
+        return JSONResponse({"error": "invalid_webhook_payload"}, status_code=400)  
+  
+    if not _verify_stripe_webhook_signature(body, stripe_signature or ""):  
+        return JSONResponse({"error": "invalid_stripe_signature"}, status_code=401)  
+  
+    try:  
+        event = json.loads(body)  
+    except (json.JSONDecodeError, UnicodeDecodeError):  
+        return JSONResponse({"error": "invalid_json"}, status_code=400)  
+    if not isinstance(event, dict):  
+        return JSONResponse({"error": "invalid_event"}, status_code=422)  
+  
+    reference, normalized_status, callback_url = _stripe_event_to_sinotrust_status(event)  
+    if not normalized_status:  
+        # Acknowledge unrelated Stripe events so Stripe does not retry them.  
+        return {"ok": True, "ignored": True}  
+  
+    event_id = str(event.get("id") or hashlib.sha256(body).hexdigest())[:255]  
+    if not reference or not callback_url:  
+        logger.error("stripe_webhook_missing_sinotrust_metadata event_id=%s", event_id)  
+        return JSONResponse({"error": "missing_sinotrust_metadata"}, status_code=422)  
+  
+    try:  
+        await asyncio.to_thread(  
+            _forward_payment_status_to_sinotrust,  
+            callback_url,  
+            reference,  
+            normalized_status,  
+            event_id,  
+        )  
+    except Exception as exc:  
+        logger.exception("stripe_webhook_forward_failed event_id=%s", event_id)  
+        # Returning 502 intentionally asks Stripe to retry the event later.  
+        return JSONResponse(  
+            {"error": "payment_status_forward_failed", "detail": str(exc)[:200]},  
+            status_code=502,  
+        )  
+    return {"ok": True, "forwarded": True}  
   
   
 def run_prelaunch_selftest():  
