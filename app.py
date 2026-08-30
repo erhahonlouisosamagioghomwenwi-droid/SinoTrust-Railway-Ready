@@ -2576,7 +2576,7 @@ def resolve_organization(db, user_id: int, requested_org_id=None):
     return db.execute(  
         "SELECT o.*,m.role member_role FROM organizations o "  
         "JOIN organization_members m ON m.organization_id=o.id "  
-        "WHERE m.user_id=? ORDER BY CASE WHEN m.role='owner' THEN 0 ELSE 1 END,o.idLIMIT 1",  
+        "WHERE m.user_id=? ORDER BY CASE WHEN m.role='owner' THEN 0 ELSE 1 END,o.id LIMIT 1",  
         (user_id,),  
     ).fetchone()  
   
