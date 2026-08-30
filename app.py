@@ -3160,34 +3160,127 @@ async def ai_review_case(case_id):
         excerpts.append(rendered)  
         used_chars += len(rendered)  
   
-    client=_openai_client()  
-    if client is None:  
-        result={"score":None,"summary":"AI review unavailable: configure OPENAI_API_KEY. Documents remain queued for human review.","missing":[],"risk":"unknown"}  
-    else:  
-        prompt=(  
-            "You are SinoTrust's document pre-review engine. This is decision support only; never claim legal certification. "  
-            "Assess completeness and obvious inconsistencies for a human reviewer. Return ONLY JSON with keys score (0-100), "  
-            "summary, missing (array), risk (low|medium|high). "  
-            f"Company: {case['company_name']}; Product: {case['product_name']}; Category: {case['category']}.\n\n"  
-            + "\n\n".join(excerpts)  
-        )  
-        try:  
-            def _review_call():  
-                return client.responses.create(  
-                    model=os.getenv("OPENAI_MODEL","gpt-5.6"),  
-                    input=prompt,  
-                    max_output_tokens=700,  
+    prompt=(  
+        "You are SinoTrust's document pre-review engine. This is decision support only; never claim legal certification. "  
+        "Assess completeness and obvious inconsistencies for a human reviewer. "  
+        f"Company: {case['company_name']}; Product: {case['product_name']}; Category: {case['category']}.\n\n"  
+        + "\n\n".join(excerpts)  
+    )  
+  
+    api_key=os.getenv("OPENAI_API_KEY","").strip()  
+    model=os.getenv("OPENAI_MODEL","gpt-5.6").strip() or "gpt-5.6"  
+    schema={  
+        "type":"object",  
+        "properties":{  
+            "score":{"type":"integer","minimum":0,"maximum":100},  
+            "summary":{"type":"string"},  
+            "missing":{"type":"array","items":{"type":"string"}},  
+            "risk":{"type":"string","enum":["low","medium","high"]},  
+        },  
+        "required":["score","summary","missing","risk"],  
+        "additionalProperties":False,  
+    }  
+  
+    async def _call_openai_pre_review():  
+        last_exc=None  
+  
+        # Preferred path: official OpenAI Python SDK + Responses API + Structured Outputs.  
+        client=_openai_client()  
+        if client is not None:  
+            try:  
+                def _sdk_call():  
+                    return client.responses.create(  
+                        model=model,  
+                        input=prompt,  
+                        max_output_tokens=700,  
+                        text={  
+                            "format":{  
+                                "type":"json_schema",  
+                                "name":"sinotrust_pre_review",  
+                                "schema":schema,  
+                                "strict":True,  
+                            }  
+                        },  
+                    )  
+                response=await asyncio.wait_for(  
+                    asyncio.to_thread(_sdk_call),  
+                    timeout=AI_PROVIDER_TIMEOUT_SECONDS + 2,  
                 )  
-            r=await asyncio.wait_for(  
-                asyncio.to_thread(_review_call),  
-                timeout=AI_PROVIDER_TIMEOUT_SECONDS + 2,  
+                raw=(getattr(response,"output_text","") or "").strip()  
+                if not raw:  
+                    raise RuntimeError("empty_openai_response")  
+                return json.loads(raw)  
+            except Exception as exc:  
+                last_exc=exc  
+                logger.warning("ai_pre_review_sdk_failed: %s: %s", type(exc).__name__, str(exc)[:500])  
+  
+        # Compatibility path: direct HTTPS call. This keeps the AI workflow operational  
+        # even if the deployed OpenAI SDK is missing or too old for client.responses.  
+        if not api_key:  
+            if last_exc is not None:  
+                raise last_exc  
+            raise RuntimeError("openai_api_key_missing")  
+  
+        def _rest_call():  
+            payload={  
+                "model":model,  
+                "input":prompt,  
+                "max_output_tokens":700,  
+                "text":{  
+                    "format":{  
+                        "type":"json_schema",  
+                        "name":"sinotrust_pre_review",  
+                        "schema":schema,  
+                        "strict":True,  
+                    }  
+                },  
+            }  
+            req=urllib.request.Request(  
+                "https://api.openai.com/v1/responses",  
+                data=json.dumps(payload).encode("utf-8"),  
+                headers={  
+                    "Authorization":f"Bearer {api_key}",  
+                    "Content-Type":"application/json",  
+                },  
+                method="POST",  
             )  
-            raw=(r.output_text or "").strip().strip('`')  
-            if raw.startswith('json'):  
-                raw=raw[4:].strip()  
-            result=json.loads(raw)  
-        except Exception as e:  
-            result={"score":None,"summary":f"AI pre-review could not complete ({type(e).__name__}). Human review is still available.","missing":[],"risk":"unknown"}  
+            try:  
+                with urllib.request.urlopen(req, timeout=AI_PROVIDER_TIMEOUT_SECONDS) as resp:  
+                    body=json.loads(resp.read().decode("utf-8"))  
+            except urllib.error.HTTPError as exc:  
+                try:  
+                    err_body=exc.read().decode("utf-8","replace")[:1000]  
+                except Exception:  
+                    err_body=""  
+                raise RuntimeError(f"openai_http_{exc.code}: {err_body}") from exc  
+  
+            chunks=[]  
+            for item in body.get("output",[]) or []:  
+                for content in item.get("content",[]) or []:  
+                    if content.get("type")=="output_text" and isinstance(content.get("text"),str):  
+                        chunks.append(content["text"])  
+            raw="".join(chunks).strip()  
+            if not raw:  
+                raise RuntimeError("empty_openai_response")  
+            return json.loads(raw)  
+  
+        return await asyncio.wait_for(  
+            asyncio.to_thread(_rest_call),  
+            timeout=AI_PROVIDER_TIMEOUT_SECONDS + 2,  
+        )  
+  
+    try:  
+        result=await _call_openai_pre_review()  
+    except Exception as e:  
+        # Never expose credentials. Keep a concise diagnostic in logs and a safe status in DB.  
+        logger.error("ai_pre_review_failed case_id=%s model=%s error=%s: %s",  
+                     case_id, model, type(e).__name__, str(e)[:500])  
+        result={  
+            "score":None,  
+            "summary":f"AI pre-review unavailable ({type(e).__name__}). Human review remains available.",  
+            "missing":[],  
+            "risk":"unknown",  
+        }  
   
     score=result.get("score")  
     if score is not None:  
