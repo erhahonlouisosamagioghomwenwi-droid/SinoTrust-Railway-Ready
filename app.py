@@ -16835,7 +16835,7 @@ def create_payment_checkout_request(case_id: int, amount: int, method: str, refe
         "amount": int(amount),  
         "currency": "CNY",  
         "method": method,  
-        "return_url": f"{PUBLIC_BASE_URL}/workspace",  
+        "return_url": f"{PUBLIC_BASE_URL}/",  
         "webhook_url": f"{PUBLIC_BASE_URL}/api/saas/payment-webhook",  
     }, separators=(",",":"), ensure_ascii=False).encode("utf-8")  
     headers = {  
