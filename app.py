@@ -12411,10 +12411,29 @@ async def saas_upload(case_id:int, request:Request, file:UploadFile=File(...)):
             return JSONResponse({"error":"Case not found."},404)  
   
     sha = hashlib.sha256(data).hexdigest()  
+    # Recover cleanly from a previous partially failed upload.  Older builds could  
+    # insert the document row and then fail during object-storage registration,  
+    # leaving a stale SHA-256 record that caused every retry to return 409.  
     with db_conn() as db:  
-        duplicate=db.execute("SELECT id FROM documents WHERE case_id=? AND sha256=?",(case_id,sha)).fetchone()  
+        duplicate=db.execute(  
+            "SELECT id,stored_name FROM documents WHERE case_id=? AND sha256=? ORDER BY id DESC LIMIT 1",  
+            (case_id,sha),  
+        ).fetchone()  
         if duplicate:  
-            return JSONResponse({"error":"duplicate_document","existing_id":duplicate['id']},409)  
+            duplicate_id = int(duplicate["id"])  
+            duplicate_local = Path(UPLOAD_DIR) / str(duplicate["stored_name"] or "")  
+            registry = db.execute(  
+                "SELECT backend,state FROM object_registry WHERE entity_type='document' AND entity_id=? ORDER BY id DESC LIMIT 1",  
+                (str(duplicate_id),),  
+            ).fetchone()  
+            durable_copy_exists = duplicate_local.is_file() or bool(registry and registry["state"] == "available")  
+            if durable_copy_exists:  
+                return JSONResponse({"error":"duplicate_document","existing_id":duplicate_id},409)  
+            # Stale DB row: no local file and no confirmed object-store copy. Remove  
+            # it so the user can retry the same document safely.  
+            db.execute("DELETE FROM object_registry WHERE entity_type='document' AND entity_id=?",(str(duplicate_id),))  
+            db.execute("DELETE FROM documents WHERE id=?",(duplicate_id,))  
+            logger.warning("recovered_stale_document_record id=%s case_id=%s",duplicate_id,case_id)  
   
     # Validate and scan before the file enters the permanent upload directory.  
     quarantine_dir = Path(DATA_DIR) / "quarantine"  
@@ -12453,17 +12472,45 @@ async def saas_upload(case_id:int, request:Request, file:UploadFile=File(...)):
             )  
             i=cur.lastrowid  
   
-        storage_meta = register_and_mirror_object(  
-            org["id"],  
-            "document",  
-            i,  
-            stored,  
-            str(final_path),  
-            normalize_region(org.get("home_region") or DEPLOYMENT_REGION),  
-        )  
+        # Object storage is an asynchronous durability layer, not a reason to lose  
+        # an already validated, malware-scanned upload.  If S3/registry integration  
+        # is temporarily unavailable, keep the verified local copy and continue with  
+        # an explicit mirror_pending state.  This prevents a provider outage from  
+        # surfacing as a generic HTTP 500 to the Workspace.  
+        try:  
+            storage_meta = register_and_mirror_object(  
+                org["id"],  
+                "document",  
+                i,  
+                stored,  
+                str(final_path),  
+                normalize_region(org.get("home_region") or DEPLOYMENT_REGION),  
+            )  
+        except Exception as storage_exc:  
+            logger.exception(  
+                "document_storage_registration_deferred document_id=%s case_id=%s",  
+                i,  
+                case_id,  
+            )  
+            storage_meta = {  
+                "backend":"local",  
+                "sha256":sha,  
+                "state":"mirror_pending",  
+                "storage_key":stored,  
+                "deferred":True,  
+            }  
     except Exception:  
-        # Never leave a partially accepted/quarantined file behind on failed upload.  
+        # Never leave a partially accepted/quarantined file behind on a genuine  
+        # pre-acceptance failure. If a DB row was already created, remove it too so  
+        # a retry cannot be blocked by a phantom duplicate.  
         quarantine_path.unlink(missing_ok=True)  
+        if "i" in locals():  
+            try:  
+                with db_conn() as cleanup_db:  
+                    cleanup_db.execute("DELETE FROM object_registry WHERE entity_type='document' AND entity_id=?",(str(i),))  
+                    cleanup_db.execute("DELETE FROM documents WHERE id=?",(i,))  
+            except Exception:  
+                logger.exception("document_upload_cleanup_failed document_id=%s",i)  
         if "final_path" in locals():  
             final_path.unlink(missing_ok=True)  
         raise  
