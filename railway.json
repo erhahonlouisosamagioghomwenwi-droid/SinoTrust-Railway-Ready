@@ -4,7 +4,7 @@
     "builder": "RAILPACK"
   },
   "deploy": {
-    "startCommand": "python app.py",
+    "startCommand": "freshclam && python app.py",
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
