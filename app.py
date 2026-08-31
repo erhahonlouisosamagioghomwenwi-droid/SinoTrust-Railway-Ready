@@ -2296,6 +2296,67 @@ def _bootstrap_admin_from_environment():
     logger.warning("bootstrap_admin_created_or_promoted user_id=%s; configure MFA before production",uid)  
     return True  
   
+def _recover_existing_admin_from_environment():  
+    """One-time, auditable recovery for an existing privileged administrator.  
+  
+    This path is intentionally environment-driven and nonce-protected. It never logs  
+    plaintext credentials, never creates a new administrator, and invalidates all  
+    existing sessions after a successful recovery. Reusing the same nonce is a no-op.  
+    """  
+    email=os.getenv("SINOTRUST_ADMIN_RECOVERY_EMAIL","").strip().lower()  
+    password=os.getenv("SINOTRUST_ADMIN_RECOVERY_PASSWORD","")  
+    nonce=os.getenv("SINOTRUST_ADMIN_RECOVERY_NONCE","").strip()  
+    recovery_mfa=os.getenv("SINOTRUST_ADMIN_RECOVERY_MFA_SECRET","").strip().upper().replace(" ","")  
+    if not (email or password or nonce or recovery_mfa):  
+        return False  
+    if not email or not password or not nonce:  
+        logger.error("admin_recovery_incomplete_configuration")  
+        return False  
+    if "@" not in email or not valid_password(password):  
+        logger.error("admin_recovery_invalid_credentials_format")  
+        return False  
+    if recovery_mfa:  
+        try:  
+            _totp_code(recovery_mfa,int(time.time() // MFA_STEP_SECONDS))  
+        except Exception:  
+            logger.error("admin_recovery_invalid_mfa_secret")  
+            return False  
+    nonce_digest=hashlib.sha256(nonce.encode("utf-8")).hexdigest()  
+    audit_detail=f"nonce_sha256={nonce_digest}"  
+    with db_conn() as db:  
+        already=db.execute(  
+            "SELECT 1 FROM audit_log WHERE action='admin_recovery_applied' AND detail=? LIMIT 1",  
+            (audit_detail,),  
+        ).fetchone()  
+        if already:  
+            return False  
+        user=db.execute(  
+            "SELECT id,email,role,mfa_secret,mfa_enabled FROM users WHERE email=? LIMIT 1",  
+            (email,),  
+        ).fetchone()  
+        if not user or user['role']!='admin':  
+            logger.error("admin_recovery_target_not_existing_admin")  
+            return False  
+        salt=secrets.token_hex(16)  
+        now=iso_now()  
+        if recovery_mfa:  
+            db.execute(  
+                "UPDATE users SET password_hash=?,salt=?,failed_logins=0,locked_until=NULL,mfa_secret=?,mfa_enabled=1,mfa_last_counter=NULL WHERE id=?",  
+                (password_hash(password,salt),salt,recovery_mfa,user['id']),  
+            )  
+        else:  
+            db.execute(  
+                "UPDATE users SET password_hash=?,salt=?,failed_logins=0,locked_until=NULL,mfa_last_counter=NULL WHERE id=?",  
+                (password_hash(password,salt),salt,user['id']),  
+            )  
+        db.execute("DELETE FROM sessions WHERE user_id=?",(user['id'],))  
+        db.execute(  
+            "INSERT INTO audit_log(user_id,action,entity_type,entity_id,detail,created_at) VALUES(?,?,?,?,?,?)",  
+            (user['id'],'admin_recovery_applied','user',str(user['id']),audit_detail,now),  
+        )  
+    logger.warning("admin_recovery_applied user_id=%s; remove recovery environment variables now",user['id'])  
+    return True  
+  
 SESSION_COOKIE_NAME = "sinotrust_session"  
 SESSION_TOKEN_PREFIX = "st_session_"  
   
@@ -12082,7 +12143,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <section id="saasWorkspace">  
       <div class="saas-shell"><div class="saas-head"><div><h2>SinoTrust <b>Workspace</b></h2><p>Compliance operations, document review, verification and lifecycle.</p></div><button class="saas-btn gold" onclick="stRefresh()">Refresh workspace</button></div>  
       <div class="saas-grid">  
-        <div class="saas-card"><h4>Account</h4><input id="stEmail" placeholder="Email"><input id="stPass" type="password" placeholder="Password (8+ chars)"><button class="saas-btn" onclick="stAuth('register')">Register</button><button class="saas-btn" onclick="stAuth('login')">Login</button><button class="saas-btn" onclick="stLogout()">Logout</button><div id="stAuthStatus" class="saas-status"></div></div>  
+        <div class="saas-card"><h4>Account</h4><input id="stEmail" placeholder="Email"><input id="stPass" type="password" placeholder="Password (8+ chars)"><input id="stMfa" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="MFA code (admin/reviewer)"><button class="saas-btn" onclick="stAuth('register')">Register</button><button class="saas-btn" onclick="stAuth('login')">Login</button><button class="saas-btn" onclick="stLogout()">Logout</button><div id="stAuthStatus" class="saas-status"></div></div>  
         <div class="saas-card"><h4>Company</h4><input id="stCompany" placeholder="Company name"><input id="stCountry" placeholder="Country"><input id="stReg" placeholder="Registration no."><button class="saas-btn" onclick="stCompanyCreate()">Save company</button></div>  
         <div class="saas-card"><h4>Product</h4><input id="stProduct" placeholder="Product name"><input id="stModel" placeholder="Model"><input id="stCategory" placeholder="Category"><button class="saas-btn" onclick="stProductCreate()">Add product</button></div>  
         <div class="saas-card"><h4>Compliance case</h4><select id="stPlan"><option value="base">Base ¥4,800</option><option value="professional">Professional ¥9,800</option><option value="enterprise">Enterprise ¥19,800</option></select><button class="saas-btn" onclick="stCaseCreate()">Create case</button><button class="saas-btn gold" onclick="stSubmitLatest()">Submit latest</button></div>  
@@ -12101,7 +12162,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     function stSafeId(value){const n=Number(value);return Number.isInteger(n)&&n>0?n:null}  
     function stSafeVerificationCode(value){const code=String(value??'').trim();return /^[A-Za-z0-9_-]{1,160}$/.test(code)?code:''}  
     async function stApi(path,opt={}){opt.credentials='same-origin';opt.headers=Object.assign({},opt.headers||{});let r=await fetch(path,opt),d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||d.error||'Request failed');return d}  
-    async function stAuth(mode){try{let d=await stApi('/api/saas/'+mode,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:stEmail.value,password:stPass.value})});stAuthStatus.textContent='Authenticated: '+d.email;await stRefresh()}catch(e){stAuthStatus.textContent=e.message}}  
+    async function stAuth(mode){try{const payload={email:stEmail.value,password:stPass.value};if(mode==='login'&&typeof stMfa!=='undefined'){const code=String(stMfa.value||'').trim();if(code)payload.mfa_code=code}let d=await stApi('/api/saas/'+mode,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});stAuthStatus.textContent='Authenticated: '+d.email+(d.role?' ('+d.role+')':'');await stRefresh()}catch(e){stAuthStatus.textContent=e.message}}  
     async function stLogout(){try{await stApi('/api/saas/logout',{method:'POST'});stLatestCase=null;stLatestProduct=null;stLatestCompany=null;stAuthStatus.textContent='Logged out';stData.textContent='Login to load your workspace.';stNotifications.textContent=''}catch(e){stAuthStatus.textContent=e.message}}  
     async function stCompanyCreate(){try{let d=await stApi('/api/saas/companies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:stCompany.value,country:stCountry.value,registration_no:stReg.value})});stLatestCompany=d.id;stRefresh()}catch(e){alert(e.message)}}  
     async function stProductCreate(){try{if(!stLatestCompany){let w=await stApi('/api/saas/workspace');stLatestCompany=w.companies?.[0]?.id}let d=await stApi('/api/saas/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({company_id:stLatestCompany,name:stProduct.value,model:stModel.value,category:stCategory.value})});stLatestProduct=d.id;stRefresh()}catch(e){alert(e.message)}}  
@@ -12874,6 +12935,7 @@ async def admin_reset_user_mfa(user_id: int, request: Request, x_reviewer_key: O
 @sinotrust_on_startup  
 async def privileged_identity_bootstrap():  
     _bootstrap_admin_from_environment()  
+    _recover_existing_admin_from_environment()  
   
 def reviewer_ok(key):  
     # Deprecated compatibility shim. Shared reviewer secrets are intentionally disabled.  
