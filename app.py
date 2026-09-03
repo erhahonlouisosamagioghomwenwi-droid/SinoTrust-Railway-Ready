@@ -12957,7 +12957,7 @@ def reviewer_authorized(request: Request, key: Optional[str] = None):
 async def reviewer_cases(request:Request,x_reviewer_key:Optional[str]=Header(default=None)):  
     reviewer=reviewer_authorized(request,x_reviewer_key)  
     if not reviewer: return JSONResponse({"error":"reviewer_unauthorized"},401)  
-    with db_conn() as db: rows=[dict(x) for x in db.execute("SELECT c.*,p.nameproduct_name,co.name company_name,co.organization_id FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.status IN ('submitted','in_review','changes_requested') ORDER BY c.submitted_at")]  
+    with db_conn() as db: rows=[dict(x) for x in db.execute("SELECT c.*,p.name product_name,co.name company_name,co.organization_id FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.status IN ('submitted','in_review','changes_requested') ORDER BY c.submitted_at")]  
     return {"cases":rows}  
   
 @app.post("/api/reviewer/cases/{case_id}/decision", include_in_schema=False)  
@@ -12965,7 +12965,7 @@ async def reviewer_decision(case_id:int,payload:ReviewPayload,request:Request,x_
     reviewer=reviewer_authorized(request,x_reviewer_key)  
     if not reviewer: return JSONResponse({"error":"reviewer_unauthorized"},401)  
     with db_conn() as db:  
-        row=db.execute("SELECT c.*,p.name product_name,p.model,co.namecompany_name,co.user_id,co.organization_id FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=?",(case_id,)).fetchone()  
+        row=db.execute("SELECT c.*,p.name product_name,p.model,co.name company_name,co.user_id,co.organization_id FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=?",(case_id,)).fetchone()  
         if not row: return JSONResponse({"error":"Case not found."},404)  
         if row['status'] not in {'submitted','in_review','changes_requested'}: return JSONResponse({"error":"invalid_case_state"},409)  
         old=row['status']; now=iso_now()  
@@ -12998,7 +12998,7 @@ async def public_verify(code:str):
         return HTMLResponse("<h1>Verification not found</h1><p>Demo verification records are not valid in live mode.</p>",404)  
     expire_due_cases()  
     with db_conn() as db:  
-        r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.namecompany_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.verification_code=? AND c.status IN ('approved','expired')",(code,)).fetchone()  
+        r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.verification_code=? AND c.status IN ('approved','expired')",(code,)).fetchone()  
     if not r: return HTMLResponse("<h1>Verification not found</h1><p>No SinoTrust record matches this code.</p>",404)  
     is_demo_code=str(r['verification_code'] or "").startswith("DEMO-ST-")  
     valid=r['status']=='approved' and (not r['expires_at'] or r['expires_at']>iso_now()) and not is_demo_code  
@@ -13013,7 +13013,7 @@ async def public_verify(code:str):
 async def certificate(case_id:int,request:Request):  
     try: u,org=require_org(request,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
-    with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,co.namecompany_name FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status='approved'",(case_id,org['id'])).fetchone()  
+    with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,co.name company_name FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status='approved'",(case_id,org['id'])).fetchone()  
     if not r: return JSONResponse({"error":"Approved certificate not found."},404)  
     code=str(r["verification_code"] or "")  
     if IS_DEMO_MODE and not code.startswith("DEMO-ST-"):  
@@ -16463,7 +16463,7 @@ async def level15_get_matches(rfq_id: int, request: Request):
         if not owned:  
             return JSONResponse({"error":"rfq_not_found"},404)  
         rows = [dict(x) for x in db.execute(  
-            "SELECT m.score,m.reasons_json,c.id case_id,c.verification_code,c.expires_at,p.nameproduct_name,p.model,p.category,co.name company_name,co.country "  
+            "SELECT m.score,m.reasons_json,c.id case_id,c.verification_code,c.expires_at,p.name product_name,p.model,p.category,co.name company_name,co.country "  
             "FROM rfq_matches m JOIN cases c ON c.id=m.case_id JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id "  
             "WHERE m.rfq_id=? ORDER BY m.score DESC,m.id ASC",  
             (rfq_id,),  
@@ -16502,7 +16502,7 @@ async def level15_supplier_interests(request: Request):
         return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
     with db_conn() as db:  
         rows = [dict(x) for x in db.execute(  
-            "SELECT i.id,i.status,i.note,i.created_at,i.buyer_organization_id,c.id case_id,p.nameproduct_name,p.model "  
+            "SELECT i.id,i.status,i.note,i.created_at,i.buyer_organization_id,c.id case_id,p.name product_name,p.model "  
             "FROM product_interest i JOIN cases c ON c.id=i.case_id JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id "  
             "WHERE co.organization_id=? ORDER BY i.id DESC LIMIT 200",  
             (org["id"],),  
