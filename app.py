@@ -12713,6 +12713,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     .st-cert-empty{padding:14px;border:1px dashed #cbd5e1;border-radius:10px;color:#64748b;background:#f8fafc;font-size:13px}  
     .st-cert-valid{background:#dcfce7;color:#166534}  
     .st-cert-expired{background:#ffedd5;color:#9a3412}  
+    .st-cert-revoked{background:#fee2e2;color:#991b1b}  
     @media(max-width:650px){.st-certificate{grid-template-columns:1fr}.st-cert-qr{width:120px;height:120px}.st-certificates-grid{grid-template-columns:1fr}}  
   
     </style>  
@@ -12757,6 +12758,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       
     function stCertificateState(x){  
       const status=String(x?.status||'').toLowerCase();  
+      if(status==='revoked')return {label:'REVOKED',cls:'st-cert-revoked'};  
       if(status==='expired')return {label:'EXPIRED',cls:'st-cert-expired'};  
       return {label:'VALID',cls:'st-cert-valid'};  
     }  
@@ -12796,7 +12798,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       const rows=(Array.isArray(cases)?cases:[]).filter(x=>{  
         const code=stSafeVerificationCode(x?.verification_code);  
         const status=String(x?.status||'').toLowerCase();  
-        return code&&(status==='approved'||status==='expired');  
+        return code&&(status==='approved'||status==='expired'||status==='revoked');  
       });  
       if(!rows.length){  
         host.innerHTML='<div class="st-cert-empty">No approved certificates yet. A certificate appears here automatically after human review approval.</div>';  
@@ -13663,15 +13665,29 @@ async def public_verify(code:str):
         return HTMLResponse("<h1>Verification not found</h1><p>Demo verification records are not valid in live mode.</p>",404)  
     expire_due_cases()  
     with db_conn() as db:  
-        r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.verification_code=? AND c.status IN ('approved','expired')",(code,)).fetchone()  
+        r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.verification_code=? AND c.status IN ('approved','expired','revoked')",(code,)).fetchone()  
     if not r:  
         return HTMLResponse("<h1>Verification not found</h1><p>No SinoTrust record matches this code.</p>",404)  
     is_demo_code=str(r['verification_code'] or "").startswith("DEMO-ST-")  
-    valid=r['status']=='approved' and (not r['expires_at'] or r['expires_at']>iso_now()) and not is_demo_code  
-    state='DEMO — NOT A LIVE CERTIFICATION' if is_demo_code else ('VALID' if valid else 'EXPIRED')  
-    state_class='demo' if is_demo_code else ('valid' if valid else 'expired')  
-    demo_notice="<div class='notice'><b>Demonstration record only.</b> It has no live certification, payment or commercial effect.</div>" if is_demo_code else ""  
-    return HTMLResponse(f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='robots' content='noindex,follow'><title>SinoTrust Verification — {safe_text(code)}</title><style>body{{margin:0;font-family:Arial,sans-serif;background:#f8fafc;color:#0f172a}}.top{{background:#0f172a;color:white;padding:24px}}.top b{{color:#d4af37;font-size:22px}}main{{max-width:760px;margin:34px auto;background:white;padding:34px;border-radius:14px;box-shadow:0 10px 30px #0f172a12}}.status{{display:inline-block;padding:9px 14px;border-radius:999px;font-weight:700}}.valid{{background:#ecfdf5;color:#047857}}.expired,.demo{{background:#fff7ed;color:#b45309}}.grid{{display:grid;grid-template-columns:160px 1fr;gap:12px 18px;margin-top:26px}}.k{{font-weight:700;color:#475569}}.notice{{padding:12px;background:#fff7ed;border:1px solid #fdba74;border-radius:8px;margin:18px 0}}small{{color:#64748b}}@media(max-width:600px){{main{{margin:16px;padding:22px}}.grid{{grid-template-columns:1fr;gap:5px}}.k{{margin-top:9px}}}}</style></head><body><header class='top'><b>SinoTrust Europe</b><div>Public Verification Record</div></header><main><span class='status {state_class}'>{safe_text(state)}</span>{demo_notice}<div class='grid'><div class='k'>Company</div><div>{safe_text(r['company_name'])}</div><div class='k'>Country</div><div>{safe_text(r['country'] or '-')}</div><div class='k'>Product</div><div>{safe_text(r['product_name'])}</div><div class='k'>Model</div><div>{safe_text(r['model'] or '-')}</div><div class='k'>Category</div><div>{safe_text(r['category'] or '-')}</div><div class='k'>Verification code</div><div>{safe_text(r['verification_code'])}</div><div class='k'>Approved</div><div>{safe_text(r['approved_at'] or '-')}</div><div class='k'>Valid until</div><div>{safe_text(r['expires_at'] or '-')}</div></div><hr style='margin:28px 0;border:0;border-top:1px solid #e2e8f0'><small>This public SinoTrust verification record does not replace legally mandatory product certifications. Always verify the current status using this page.</small></main></body></html>""")  
+    status=str(r['status'] or "").strip().lower()  
+    valid=status=='approved' and (not r['expires_at'] or r['expires_at']>iso_now()) and not is_demo_code  
+    if is_demo_code:  
+        state='DEMO — NOT A LIVE CERTIFICATION'  
+        state_class='demo'  
+        lifecycle_notice="<div class='notice'><b>Demonstration record only.</b> It has no live certification, payment or commercial effect.</div>"  
+    elif status=='revoked':  
+        state='REVOKED'  
+        state_class='revoked'  
+        lifecycle_notice="<div class='notice revoked-notice'><b>This SinoTrust verification record has been revoked.</b> It must not be represented as a current valid verification record.</div>"  
+    elif valid:  
+        state='VALID'  
+        state_class='valid'  
+        lifecycle_notice=""  
+    else:  
+        state='EXPIRED'  
+        state_class='expired'  
+        lifecycle_notice="<div class='notice'><b>This SinoTrust verification record has expired.</b> Verify renewal status before relying on it.</div>"  
+    return HTMLResponse(f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='robots' content='noindex,follow'><title>SinoTrust Verification — {safe_text(code)}</title><style>body{{margin:0;font-family:Arial,sans-serif;background:#f8fafc;color:#0f172a}}.top{{background:#0f172a;color:white;padding:24px}}.top b{{color:#d4af37;font-size:22px}}main{{max-width:760px;margin:34px auto;background:white;padding:34px;border-radius:14px;box-shadow:0 10px 30px #0f172a12}}.status{{display:inline-block;padding:9px 14px;border-radius:999px;font-weight:700}}.valid{{background:#ecfdf5;color:#047857}}.expired,.demo{{background:#fff7ed;color:#b45309}}.revoked{{background:#fee2e2;color:#991b1b}}.grid{{display:grid;grid-template-columns:160px 1fr;gap:12px 18px;margin-top:26px}}.k{{font-weight:700;color:#475569}}.notice{{padding:12px;background:#fff7ed;border:1px solid #fdba74;border-radius:8px;margin:18px 0}}.revoked-notice{{background:#fef2f2;border-color:#fecaca;color:#7f1d1d}}small{{color:#64748b}}@media(max-width:600px){{main{{margin:16px;padding:22px}}.grid{{grid-template-columns:1fr;gap:5px}}.k{{margin-top:9px}}}}</style></head><body><header class='top'><b>SinoTrust Europe</b><div>Public Verification Record</div></header><main><span class='status {state_class}'>{safe_text(state)}</span>{lifecycle_notice}<div class='grid'><div class='k'>Company</div><div>{safe_text(r['company_name'])}</div><div class='k'>Country</div><div>{safe_text(r['country'] or '-')}</div><div class='k'>Product</div><div>{safe_text(r['product_name'])}</div><div class='k'>Model</div><div>{safe_text(r['model'] or '-')}</div><div class='k'>Category</div><div>{safe_text(r['category'] or '-')}</div><div class='k'>Verification code</div><div>{safe_text(r['verification_code'])}</div><div class='k'>Approved</div><div>{safe_text(r['approved_at'] or '-')}</div><div class='k'>Valid until</div><div>{safe_text(r['expires_at'] or '-')}</div></div><hr style='margin:28px 0;border:0;border-top:1px solid #e2e8f0'><small>This public SinoTrust verification record does not replace legally mandatory product certifications. Always verify the current status using this page.</small></main></body></html>""")  
   
   
 @app.get("/api/saas/cases/{case_id}/verification-qr.png", include_in_schema=False)  
@@ -13685,7 +13701,7 @@ async def case_verification_qr(case_id:int,request:Request):
             "SELECT c.verification_code,c.status,c.expires_at "  
             "FROM cases c JOIN products p ON p.id=c.product_id "  
             "JOIN companies co ON co.id=p.company_id "  
-            "WHERE c.id=? AND co.organization_id=? AND c.status IN ('approved','expired')",  
+            "WHERE c.id=? AND co.organization_id=? AND c.status IN ('approved','expired','revoked')",  
             (case_id,org['id']),  
         ).fetchone()  
     if not r or not r["verification_code"]:  
@@ -13722,7 +13738,7 @@ async def case_verification_qr(case_id:int,request:Request):
 async def certificate(case_id:int,request:Request):  
     try: u,org=require_org(request,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
-    with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status IN ('approved','expired')",(case_id,org['id'])).fetchone()  
+    with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status IN ('approved','expired','revoked')",(case_id,org['id'])).fetchone()  
     if not r: return JSONResponse({"error":"Verification record not found."},404)  
     code=str(r["verification_code"] or "")  
     if IS_DEMO_MODE and not code.startswith("DEMO-ST-"):  
