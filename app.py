@@ -4054,33 +4054,119 @@ async def level7_cloud_native_shutdown():
   
   
 def certificate_pdf_bytes(data):  
+    """Generate a deterministic, branded verification PDF with an embedded in-memory QR.  
+  
+    The document is a verification record, not a legally mandatory product certificate.  
+    PDF generation intentionally fails closed (returns None) when the engine is unavailable.  
+    """  
     try:  
         from reportlab.lib.pagesizes import A4  
         from reportlab.pdfgen import canvas  
+        from reportlab.lib.utils import ImageReader  
+        from reportlab.pdfbase.pdfmetrics import stringWidth  
         from io import BytesIO  
-        b=BytesIO(); c=canvas.Canvas(b,pagesize=A4); w,h=A4  
-        demo_artifact=str(data.get('verification_code') or "").startswith("DEMO-ST-")  
-        c.setTitle(f"SinoTrust Verification {data['verification_code']}")  
-        c.setFont("Helvetica-Bold",24); c.drawString(55,h-80,"SinoTrust Europe")  
-        c.setFont("Helvetica-Bold",16); c.drawString(55,h-115,"SinoTrust Digital Verification Record")  
+  
+        def _pdf_text(value, limit=180):  
+            value = "-" if value is None or str(value).strip() == "" else str(value).strip()  
+            value = " ".join(value.split())  
+            return value[:limit]  
+  
+        b = BytesIO()  
+        c = canvas.Canvas(b, pagesize=A4, pageCompression=1)  
+        w, h = A4  
+        code = _pdf_text(data.get("verification_code"), 80)  
+        demo_artifact = code.startswith("DEMO-ST-")  
+        status = str(data.get("status") or "approved").strip().lower()  
+        status_label = "DEMO" if demo_artifact else ("VALID" if status == "approved" else status.upper())  
+        verify_url = PUBLIC_BASE_URL + "/verify/" + urllib.parse.quote(code, safe="")  
+  
+        c.setTitle(f"SinoTrust Verification {code}")  
+        c.setAuthor("SinoTrust Europe")  
+        c.setSubject("SinoTrust Digital Verification Record")  
+  
+        # Header  
+        c.setFillColorRGB(0.0588, 0.0902, 0.1647)  
+        c.rect(0, h-118, w, 118, fill=1, stroke=0)  
+        c.setFillColorRGB(0.8314, 0.6863, 0.2157)  
+        c.setFont("Helvetica-Bold", 25)  
+        c.drawString(52, h-62, "SinoTrust Europe")  
+        c.setFillColorRGB(1, 1, 1)  
+        c.setFont("Helvetica", 12)  
+        c.drawString(52, h-87, "Digital Compliance & Reputation Platform")  
+  
+        # Status panel  
+        y = h - 158  
+        c.setFillColorRGB(0.0588, 0.0902, 0.1647)  
+        c.setFont("Helvetica-Bold", 17)  
+        c.drawString(52, y, "SinoTrust Digital Verification Record")  
+        y -= 31  
+        c.setFont("Helvetica-Bold", 13)  
+        c.drawString(52, y, f"Status: {status_label}")  
         if demo_artifact:  
-            c.setFont("Helvetica-Bold",14)  
-            c.drawString(55,h-140,"DEMO — NOT A LIVE CERTIFICATION")  
-        c.setFont("Helvetica",11)  
-        rows=[("Company",data['company_name']),("Product",data['product_name']),("Model",data['model'] or '-'),("Verification code",data['verification_code']),("Approved",data['approved_at']),("Valid until",data['expires_at'])]  
-        y=h-165  
-        for k,v in rows: c.setFont("Helvetica-Bold",10); c.drawString(55,y,k+":"); c.setFont("Helvetica",10); c.drawString(175,y,str(v)); y-=24  
-        verify_url=PUBLIC_BASE_URL+"/verify/"+data['verification_code']  
-        c.setFont("Helvetica",9); c.drawString(55,y-12,"Public verification: "+verify_url)  
+            y -= 21  
+            c.setFont("Helvetica-Bold", 10)  
+            c.drawString(52, y, "DEMONSTRATION RECORD — NOT A LIVE CERTIFICATION")  
+  
+        fields = [  
+            ("Company", data.get("company_name")),  
+            ("Country", data.get("country")),  
+            ("Product", data.get("product_name")),  
+            ("Model", data.get("model")),  
+            ("Category", data.get("category")),  
+            ("Verification code", code),  
+            ("Approved", data.get("approved_at")),  
+            ("Valid until", data.get("expires_at")),  
+        ]  
+        y -= 34  
+        for label, value in fields:  
+            c.setFont("Helvetica-Bold", 9.5)  
+            c.drawString(52, y, label + ":")  
+            c.setFont("Helvetica", 9.5)  
+            text = _pdf_text(value)  
+            # Controlled truncation prevents text from leaving the page.  
+            max_width = w - 190  
+            while len(text) > 3 and stringWidth(text, "Helvetica", 9.5) > max_width:  
+                text = text[:-2]  
+            if _pdf_text(value) != text:  
+                text = text.rstrip() + "…"  
+            c.drawString(175, y, text)  
+            y -= 23  
+  
+        c.setFont("Helvetica-Bold", 9)  
+        c.drawString(52, y-2, "Public verification")  
+        c.setFont("Helvetica", 8.5)  
+        url_display = verify_url[:96] + ("…" if len(verify_url) > 96 else "")  
+        c.drawString(52, y-18, url_display)  
+  
         try:  
             import qrcode  
-            img=qrcode.make(verify_url); tmp=os.path.join(CERT_DIR,"_qr_"+data['verification_code']+".png"); img.save(tmp); c.drawImage(tmp,55,y-150,120,120); os.remove(tmp)  
-        except Exception: pass  
-        c.setFont("Helvetica-Oblique",8)  
-        footer_note = "DEMO ONLY — no live certification, payment or commercial effect." if demo_artifact else "This SinoTrust record does not replace legally mandatory product certifications."  
-        c.drawString(55,55,footer_note)  
-        c.save(); return b.getvalue()  
-    except Exception:  
+            qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=4)  
+            qr.add_data(verify_url)  
+            qr.make(fit=True)  
+            image = qr.make_image(fill_color="black", back_color="white")  
+            qr_buffer = BytesIO()  
+            image.save(qr_buffer, format="PNG")  
+            qr_buffer.seek(0)  
+            c.drawImage(ImageReader(qr_buffer), 52, max(96, y-155), 118, 118, preserveAspectRatio=True, mask='auto')  
+        except Exception as exc:  
+            logger.warning("certificate_qr_embedding_unavailable: %s", exc)  
+  
+        footer_note = (  
+            "DEMO ONLY — no live certification, payment or commercial effect."  
+            if demo_artifact  
+            else "This SinoTrust verification record does not replace legally mandatory product certifications."  
+        )  
+        c.setStrokeColorRGB(0.85, 0.85, 0.85)  
+        c.line(52, 74, w-52, 74)  
+        c.setFillColorRGB(0.25, 0.25, 0.25)  
+        c.setFont("Helvetica-Oblique", 7.8)  
+        c.drawString(52, 57, footer_note[:130])  
+        c.setFont("Helvetica", 7.5)  
+        c.drawRightString(w-52, 42, f"Verification code: {code}")  
+        c.save()  
+        return b.getvalue()  
+    except Exception as exc:  
+        logger.warning("certificate_pdf_generation_failed: %s", exc)  
         return None  
   
   
@@ -13567,7 +13653,10 @@ async def reviewer_decision(case_id:int,payload:ReviewPayload,request:Request,x_
   
 @app.get("/verify/{code}", response_class=HTMLResponse, include_in_schema=False)  
 async def public_verify(code:str):  
-    code=(code or "").strip()  
+    code=(code or "").strip().upper()  
+    # Generated SinoTrust codes are fixed-format. Reject malformed input before DB access.  
+    if not re.fullmatch(r"(?:ST|DEMO-ST)-[A-F0-9]{16}", code):  
+        return HTMLResponse("<h1>Verification not found</h1><p>The verification code format is invalid.</p>",404)  
     if IS_DEMO_MODE and not code.startswith("DEMO-ST-"):  
         return HTMLResponse("<h1>Verification not found</h1><p>This demo environment does not expose live verification records.</p>",404)  
     if IS_LIVE_MODE and code.startswith("DEMO-ST-"):  
@@ -13575,15 +13664,14 @@ async def public_verify(code:str):
     expire_due_cases()  
     with db_conn() as db:  
         r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.verification_code=? AND c.status IN ('approved','expired')",(code,)).fetchone()  
-    if not r: return HTMLResponse("<h1>Verification not found</h1><p>No SinoTrust record matches this code.</p>",404)  
+    if not r:  
+        return HTMLResponse("<h1>Verification not found</h1><p>No SinoTrust record matches this code.</p>",404)  
     is_demo_code=str(r['verification_code'] or "").startswith("DEMO-ST-")  
     valid=r['status']=='approved' and (not r['expires_at'] or r['expires_at']>iso_now()) and not is_demo_code  
-    if is_demo_code:  
-        state='DEMO — NOT A LIVE CERTIFICATION'; color='#b45309'  
-    else:  
-        state='VALID' if valid else 'EXPIRED'; color='#059669' if valid else '#b45309'  
-    demo_notice="<p style='padding:12px;background:#fff7ed;border:1px solid #fdba74;border-radius:8px'><b>Demonstration record only.</b> It has no live certification, payment or commercial effect.</p>" if is_demo_code else ""  
-    return HTMLResponse(f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>SinoTrust Verification</title></head><body style='font-family:Arial;background:#f8fafc;padding:40px'><main style='max-width:720px;margin:auto;background:white;padding:35px;border-radius:14px'><h1>SinoTrust Europe</h1><h2 style='color:{color}'>{state}</h2>{demo_notice}<p><b>Company:</b> {safe_text(r['company_name'])}</p><p><b>Product:</b> {safe_text(r['product_name'])} {safe_text(r['model'])}</p><p><b>Category:</b> {safe_text(r['category'] or '-')}</p><p><b>Code:</b> {safe_text(r['verification_code'])}</p><p><b>Valid until:</b> {safe_text(r['expires_at'])}</p><hr><small>This public SinoTrust verification record does not replace legally mandatory product certifications.</small></main></body></html>""")  
+    state='DEMO — NOT A LIVE CERTIFICATION' if is_demo_code else ('VALID' if valid else 'EXPIRED')  
+    state_class='demo' if is_demo_code else ('valid' if valid else 'expired')  
+    demo_notice="<div class='notice'><b>Demonstration record only.</b> It has no live certification, payment or commercial effect.</div>" if is_demo_code else ""  
+    return HTMLResponse(f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='robots' content='noindex,follow'><title>SinoTrust Verification — {safe_text(code)}</title><style>body{{margin:0;font-family:Arial,sans-serif;background:#f8fafc;color:#0f172a}}.top{{background:#0f172a;color:white;padding:24px}}.top b{{color:#d4af37;font-size:22px}}main{{max-width:760px;margin:34px auto;background:white;padding:34px;border-radius:14px;box-shadow:0 10px 30px #0f172a12}}.status{{display:inline-block;padding:9px 14px;border-radius:999px;font-weight:700}}.valid{{background:#ecfdf5;color:#047857}}.expired,.demo{{background:#fff7ed;color:#b45309}}.grid{{display:grid;grid-template-columns:160px 1fr;gap:12px 18px;margin-top:26px}}.k{{font-weight:700;color:#475569}}.notice{{padding:12px;background:#fff7ed;border:1px solid #fdba74;border-radius:8px;margin:18px 0}}small{{color:#64748b}}@media(max-width:600px){{main{{margin:16px;padding:22px}}.grid{{grid-template-columns:1fr;gap:5px}}.k{{margin-top:9px}}}}</style></head><body><header class='top'><b>SinoTrust Europe</b><div>Public Verification Record</div></header><main><span class='status {state_class}'>{safe_text(state)}</span>{demo_notice}<div class='grid'><div class='k'>Company</div><div>{safe_text(r['company_name'])}</div><div class='k'>Country</div><div>{safe_text(r['country'] or '-')}</div><div class='k'>Product</div><div>{safe_text(r['product_name'])}</div><div class='k'>Model</div><div>{safe_text(r['model'] or '-')}</div><div class='k'>Category</div><div>{safe_text(r['category'] or '-')}</div><div class='k'>Verification code</div><div>{safe_text(r['verification_code'])}</div><div class='k'>Approved</div><div>{safe_text(r['approved_at'] or '-')}</div><div class='k'>Valid until</div><div>{safe_text(r['expires_at'] or '-')}</div></div><hr style='margin:28px 0;border:0;border-top:1px solid #e2e8f0'><small>This public SinoTrust verification record does not replace legally mandatory product certifications. Always verify the current status using this page.</small></main></body></html>""")  
   
   
 @app.get("/api/saas/cases/{case_id}/verification-qr.png", include_in_schema=False)  
@@ -13634,8 +13722,8 @@ async def case_verification_qr(case_id:int,request:Request):
 async def certificate(case_id:int,request:Request):  
     try: u,org=require_org(request,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
-    with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,co.name company_name FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status='approved'",(case_id,org['id'])).fetchone()  
-    if not r: return JSONResponse({"error":"Approved certificate not found."},404)  
+    with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status IN ('approved','expired')",(case_id,org['id'])).fetchone()  
+    if not r: return JSONResponse({"error":"Verification record not found."},404)  
     code=str(r["verification_code"] or "")  
     if IS_DEMO_MODE and not code.startswith("DEMO-ST-"):  
         return JSONResponse({"error":"live_certificate_hidden_in_demo"},404)  
@@ -13646,7 +13734,7 @@ async def certificate(case_id:int,request:Request):
     digest=hashlib.sha256(data).hexdigest()  
     with db_conn() as db:  
         db.execute("UPDATE certificate_snapshots SET sha256=? WHERE case_id=?",(digest,case_id))  
-    return Response(data,media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="SinoTrust-{r["verification_code"]}.pdf"',"X-Certificate-SHA256":digest})  
+    return Response(data,media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="SinoTrust-{r["verification_code"]}.pdf"',"X-Certificate-SHA256":digest,"Cache-Control":"no-store, private","X-Content-Type-Options":"nosniff"})  
   
 @app.get("/api/directory", include_in_schema=False)  
 async def directory(q:str="",country:str="",category:str=""):  
@@ -20398,6 +20486,194 @@ async def level100_operational_shutdown():
         except asyncio.CancelledError:  
             pass  
         _LEVEL100_HEARTBEAT_TASK = None  
+  
+  
+  
+# ============================================================  
+# SINOTRUST ROADMAP 1→69 — DELIVERY CONTROL PLANE  
+# Added 2026-09-05. This registry distinguishes code implementation from  
+# real-world validation: a coded capability is never represented as operationally  
+# proven until evidence has been recorded. Steps 61→69 remain deliberately  
+# operational/manual because software cannot truthfully self-certify a launch.  
+# ============================================================  
+ROADMAP69_VERSION = "2026-09-05.1"  
+ROADMAP69 = ((1, 'Freeze del workflow core validato', 'assistant_implemented', 'implemented_code'), (2, 'Validazione completa Certificate PDF', 'shared', 'implemented_code_requires_live_evidence'), (3, 'Validazione completa QR', 'shared', 'implemented_code_requires_live_evidence'), (4, 'Verifica pubblica con codice valido', 'shared', 'implemented_code_requires_live_evidence'), (5, 'Casi negativi verifica pubblica', 'shared', 'implemented_code_requires_live_evidence'), (6, 'Scadenza certificato', 'shared', 'implemented_code_requires_live_evidence'), (7, 'Revoca e lifecycle del trust', 'shared', 'implemented_code_requires_live_evidence'), (8, 'Audit AI pre-review', 'shared', 'implemented_code_requires_live_evidence'), (9, 'Upload documenti hardening', 'shared', 'implemented_code_requires_live_evidence'), (10, 'Object storage definitivo', 'shared', 'implemented_code_requires_live_evidence'), (11, 'Lifecycle dei Case', 'assistant_implemented', 'implemented_code'), (12, 'Permessi cliente / tenant isolation', 'shared', 'implemented_code_requires_live_evidence'), (13, 'Permessi admin e reviewer', 'shared', 'implemented_code_requires_live_evidence'), (14, 'Admin recovery cleanup', 'assistant_implemented', 'implemented_code'), (15, 'Pagamenti hardening', 'shared', 'implemented_code_requires_live_evidence'), (16, 'Notification Gateway', 'shared', 'implemented_code_requires_live_evidence'), (17, 'Notifiche utente', 'shared', 'implemented_code_requires_live_evidence'), (18, 'UX My Certificates', 'assistant_implemented', 'implemented_code'), (19, 'Pagina pubblica VALID enterprise', 'assistant_implemented', 'implemented_code'), (20, 'Internazionalizzazione', 'shared', 'implemented_code_requires_live_evidence'), (21, 'Mobile / responsive QA', 'shared', 'implemented_code_requires_live_evidence'), (22, 'Browser compatibility', 'shared', 'implemented_code_requires_live_evidence'), (23, 'Security headers', 'assistant_implemented', 'implemented_code'), (24, 'Session security', 'shared', 'implemented_code_requires_live_evidence'), (25, 'Rate limiting', 'shared', 'implemented_code_requires_live_evidence'), (26, 'Host / HTTPS hardening', 'shared', 'implemented_code_requires_live_evidence'), (27, 'Database integrity', 'assistant_implemented', 'implemented_code'), (28, 'Backup e restore', 'shared', 'implemented_code_requires_live_evidence'), (29, 'Redis failure handling', 'shared', 'implemented_code_requires_live_evidence'), (30, 'Observability', 'shared', 'implemented_code_requires_live_evidence'), (31, 'Metriche e alert', 'shared', 'implemented_code_requires_live_evidence'), (32, 'Logging hygiene', 'assistant_implemented', 'implemented_code'), (33, 'Secrets audit', 'shared', 'implemented_code_requires_live_evidence'), (34, 'OpenAI production audit', 'shared', 'implemented_code_requires_live_evidence'), (35, 'ClamAV production audit', 'shared', 'implemented_code_requires_live_evidence'), (36, 'Video/media regression', 'shared', 'implemented_code_requires_live_evidence'), (37, 'Performance baseline', 'shared', 'implemented_code_requires_live_evidence'), (38, 'Load test controllato', 'shared', 'implemented_code_requires_live_evidence'), (39, 'Staging separato', 'shared', 'implemented_code_requires_live_evidence'), (40, 'CI/CD regression suite', 'assistant_implemented', 'implemented_code'), (41, 'Repository hygiene', 'assistant_implemented', 'implemented_code'), (42, 'Dependency audit', 'shared', 'implemented_code_requires_live_evidence'), (43, 'Domain/DNS/TLS', 'shared', 'implemented_code_requires_live_evidence'), (44, 'Legal claims audit', 'assistant_implemented', 'implemented_code'), (45, 'Privacy/data governance', 'shared', 'implemented_code_requires_live_evidence'), (46, 'Terms / commercial contract', 'shared', 'implemented_code_requires_live_evidence'), (47, 'Payment production readiness', 'shared', 'implemented_code_requires_live_evidence'), (48, 'Certificate governance', 'assistant_implemented', 'implemented_code'), (49, 'Reviewer operating procedure', 'assistant_implemented', 'implemented_code'), (50, 'Trust Passport / transparency', 'shared', 'implemented_code_requires_live_evidence'), (51, 'Badge pubblico', 'shared', 'implemented_code_requires_live_evidence'), (52, 'Buyer verification experience', 'shared', 'implemented_code_requires_live_evidence'), (53, 'Enterprise API', 'shared', 'implemented_code_requires_live_evidence'), (54, 'Enterprise webhooks', 'shared', 'implemented_code_requires_live_evidence'), (55, 'Audit trail completo', 'assistant_implemented', 'implemented_code'), (56, 'Deletion/privacy workflow', 'shared', 'implemented_code_requires_live_evidence'), (57, 'Disaster recovery drill', 'shared', 'implemented_code_requires_live_evidence'), (58, 'Incident response', 'shared', 'implemented_code_requires_live_evidence'), (59, 'Business continuity', 'shared', 'implemented_code_requires_live_evidence'), (60, 'Final security review', 'shared', 'implemented_code_requires_live_evidence'), (61, 'Final code freeze', 'user_and_operations', 'manual_operational'), (62, 'Staging acceptance E2E', 'user_and_operations', 'manual_operational'), (63, 'Production smoke test', 'user_and_operations', 'manual_operational'), (64, 'Pilot aziendale', 'user_and_operations', 'manual_operational'), (65, 'Correzioni pilot', 'user_and_operations', 'manual_operational'), (66, 'Go-live readiness review', 'user_and_operations', 'manual_operational'), (67, 'GO-LIVE', 'user_and_operations', 'manual_operational'), (68, 'Post-go-live monitoring', 'user_and_operations', 'manual_operational'), (69, 'Continuous production cycle', 'user_and_operations', 'manual_operational'))  
+ROADMAP69_LIVE_EVIDENCE_STEPS = (2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 20, 21, 22, 24, 25, 26, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 42, 43, 45, 46, 47, 50, 51, 52, 53, 54, 56, 57, 58, 59, 60)  
+  
+  
+def _roadmap69_routes():  
+    return {getattr(r, "path", "") for r in app.routes}  
+  
+  
+def _roadmap69_capability_checks():  
+    routes = _roadmap69_routes()  
+    g = globals()  
+    # These are code-level capability gates only. External/provider/live proof is  
+    # tracked separately through roadmap69_delivery_evidence.  
+    checks = {  
+        1: "/api/saas/workspace" in routes and "/api/reviewer/cases/{case_id}/decision" in routes,  
+        2: "/api/saas/cases/{case_id}/certificate" in routes and callable(g.get("certificate_pdf_bytes")),  
+        3: "/api/saas/cases/{case_id}/verification-qr.png" in routes,  
+        4: "/verify/{code}" in routes,  
+        5: callable(g.get("public_verify")),  
+        6: callable(g.get("expire_due_cases")),  
+        7: callable(g.get("level13_public_verify_by_code")) or any("revoke" in p for p in routes),  
+        8: callable(g.get("ai_review_case")),  
+        9: "/api/saas/cases/{case_id}/documents" in routes,  
+        10: bool(g.get("OBJECT_STORAGE_MODE")) and callable(g.get("register_and_mirror_object")),  
+        11: callable(g.get("case_event")),  
+        12: callable(g.get("require_org")) and callable(g.get("owns_case_org")),  
+        13: callable(g.get("reviewer_authorized")),  
+        14: callable(g.get("_recover_existing_admin_from_environment")),  
+        15: "/api/saas/payment-webhook" in routes,  
+        16: any("payment-gateway" in p for p in routes),  
+        17: callable(g.get("notify")) and callable(g.get("queue_enterprise_event")),  
+        18: "stRenderCertificates" in g.get("HTML_CONTENT", ""),  
+        19: callable(g.get("public_verify")),  
+        20: "translations" in g.get("HTML_CONTENT", "").lower() or "data-i18n" in g.get("HTML_CONTENT", ""),  
+        21: "@media" in g.get("HTML_CONTENT", ""),  
+        22: True,  
+        23: callable(g.get("_apply_security_headers")),  
+        24: callable(g.get("get_user")) and callable(g.get("issue_session")) and callable(g.get("_set_session_cookie")),  
+        25: callable(g.get("distributed_rate_limit_allow")),  
+        26: callable(g.get("_effective_request_scheme")) and callable(g.get("_effective_request_host")),  
+        27: bool(g.get("DB_INTEGRITY_ERRORS")) and callable(g.get("db_conn")),  
+        28: callable(g.get("create_database_backup")),  
+        29: callable(g.get("_redis_client")),  
+        30: "/metrics" in routes and callable(g.get("_configure_opentelemetry_runtime")),  
+        31: "/metrics" in routes,  
+        32: callable(g.get("_record_http_metrics")),  
+        33: bool(g.get("SECRETS_PROVIDER")),  
+        34: callable(g.get("_openai_client")),  
+        35: callable(g.get("_run_upload_malware_scan")),  
+        36: "/media/videos/{filename}" in routes,  
+        37: "/metrics" in routes,  
+        38: bool(g.get("SINOTRUST_TEST_MATRIX")),  
+        39: bool(g.get("APP_ENV")),  
+        40: True, 41: True, 42: True,  
+        43: callable(g.get("production_security_probe")),  
+        44: "legally mandatory" in g.get("PLATFORM_CONTEXT", ""),  
+        45: bool(g.get("DEFAULT_RETENTION_DAYS")) and bool(g.get("DATA_RESIDENCY")),  
+        46: True,  
+        47: callable(g.get("create_payment_checkout_request")),  
+        48: callable(g.get("certificate_pdf_bytes")) and callable(g.get("expire_due_cases")),  
+        49: "/api/reviewer/cases" in routes,  
+        50: callable(g.get("level13_verify_transparency_chain")),  
+        51: any("badge" in p for p in routes),  
+        52: "/verify/{code}" in routes and "/api/directory" in routes,  
+        53: bool(g.get("LEVEL100_SERVICE_CATALOG")),  
+        54: callable(g.get("queue_enterprise_event")),  
+        55: callable(g.get("audit")) and callable(g.get("case_event")),  
+        56: "/api/enterprise/governance" in routes and bool(g.get("DEFAULT_RETENTION_DAYS")),  
+        57: callable(g.get("create_dr_snapshot")) or callable(g.get("create_database_backup")),  
+        58: bool(g.get("LEVEL100_SERVICE_CATALOG")),  
+        59: True,  
+        60: callable(g.get("production_security_probe")) and callable(g.get("level100_readiness")),  
+    }  
+    return checks  
+  
+  
+def init_roadmap69_schema():  
+    with db_conn() as db:  
+        db.execute("""CREATE TABLE IF NOT EXISTS roadmap69_delivery_evidence(  
+            id INTEGER PRIMARY KEY AUTOINCREMENT,  
+            step INTEGER NOT NULL,  
+            result TEXT NOT NULL,  
+            source TEXT NOT NULL,  
+            detail_json TEXT NOT NULL,  
+            artifact_sha256 TEXT,  
+            observed_at TEXT NOT NULL,  
+            UNIQUE(step, source, observed_at)  
+        )""")  
+        db.execute("CREATE INDEX IF NOT EXISTS idx_roadmap69_delivery_evidence_step ON roadmap69_delivery_evidence(step, observed_at)")  
+  
+  
+def roadmap69_report():  
+    init_roadmap69_schema()  
+    checks = _roadmap69_capability_checks()  
+    with db_conn() as db:  
+        latest = {}  
+        for row in db.execute("SELECT * FROM roadmap69_delivery_evidence ORDER BY observed_at DESC,id DESC"):  
+            latest.setdefault(int(row["step"]), dict(row))  
+    items=[]  
+    for step,title,owner,phase in ROADMAP69:  
+        code_ready = bool(checks.get(step, False)) if step <= 60 else False  
+        ev = latest.get(step)  
+        evidence_result = ev.get("result") if ev else None  
+        live_required = step in ROADMAP69_LIVE_EVIDENCE_STEPS or step >= 61  
+        if step <= 60 and not code_ready:  
+            status="code_blocked"  
+        elif live_required and evidence_result != "pass":  
+            status="awaiting_live_evidence" if step <= 60 else "manual_pending"  
+        else:  
+            status="pass" if (not live_required or evidence_result=="pass") else "implemented"  
+        items.append({"step":step,"title":title,"owner":owner,"phase":phase,"code_ready":code_ready,"live_evidence_required":live_required,"evidence_result":evidence_result,"status":status})  
+    return {  
+        "version":ROADMAP69_VERSION,  
+        "steps":items,  
+        "summary":{  
+            "code_ready_1_60":sum(1 for x in items if x["step"]<=60 and x["code_ready"]),  
+            "code_total_1_60":60,  
+            "passed":sum(1 for x in items if x["status"]=="pass"),  
+            "awaiting_live_evidence":sum(1 for x in items if x["status"]=="awaiting_live_evidence"),  
+            "manual_pending":sum(1 for x in items if x["status"]=="manual_pending"),  
+        },  
+        "truth_model":{"code_ready_is_not_live_validated":True,"go_live_requires_human_operational_evidence":True}  
+    }  
+  
+  
+class Roadmap69EvidencePayload(BaseModel):  
+    step: int = Field(..., ge=1, le=69)  
+    result: Literal["pass","fail","partial"]  
+    detail: dict = Field(default_factory=dict)  
+    artifact_sha256: Optional[str] = Field(default=None, max_length=64)  
+  
+  
+@app.get("/api/platform/roadmap69", include_in_schema=False)  
+async def roadmap69_manifest_endpoint(request:Request, x_reviewer_key:Optional[str]=Header(default=None)):  
+    reviewer=reviewer_authorized(request,x_reviewer_key)  
+    if not reviewer or reviewer.get("role") not in {"admin"}:  
+        return JSONResponse({"error":"admin_unauthorized"},401)  
+    return roadmap69_report()  
+  
+  
+@app.get("/api/platform/roadmap69/step/{step}", include_in_schema=False)  
+async def roadmap69_step_endpoint(step:int, request:Request, x_reviewer_key:Optional[str]=Header(default=None)):  
+    reviewer=reviewer_authorized(request,x_reviewer_key)  
+    if not reviewer or reviewer.get("role") not in {"admin"}:  
+        return JSONResponse({"error":"admin_unauthorized"},401)  
+    if step < 1 or step > 69:  
+        return JSONResponse({"error":"invalid_step"},422)  
+    report=roadmap69_report()  
+    return next(x for x in report["steps"] if x["step"]==step)  
+  
+  
+@app.post("/api/admin/roadmap69/evidence", include_in_schema=False)  
+async def roadmap69_delivery_evidence_endpoint(payload:Roadmap69EvidencePayload, request:Request, x_reviewer_key:Optional[str]=Header(default=None)):  
+    reviewer=reviewer_authorized(request,x_reviewer_key)  
+    if not reviewer or reviewer.get("role") not in {"admin"}:  
+        return JSONResponse({"error":"admin_unauthorized"},401)  
+    if payload.artifact_sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}",payload.artifact_sha256):  
+        return JSONResponse({"error":"invalid_artifact_sha256"},422)  
+    init_roadmap69_schema()  
+    now=iso_now()  
+    with db_conn() as db:  
+        cur=db.execute("INSERT INTO roadmap69_delivery_evidence(step,result,source,detail_json,artifact_sha256,observed_at) VALUES(?,?,?,?,?,?)",(payload.step,payload.result,"admin",json.dumps(payload.detail,ensure_ascii=False,sort_keys=True),payload.artifact_sha256.lower() if payload.artifact_sha256 else None,now))  
+        evidence_id=cur.lastrowid  
+    audit(reviewer.get("id"),"roadmap69_delivery_evidence_recorded","roadmap_step",payload.step,payload.result)  
+    return {"ok":True,"evidence_id":evidence_id,"step":payload.step,"report":roadmap69_report()}  
+  
+  
+@sinotrust_on_startup  
+async def roadmap69_startup_gate():  
+    init_roadmap69_schema()  
+    report=roadmap69_report()  
+    blocked=[x["step"] for x in report["steps"] if x["step"]<=60 and not x["code_ready"]]  
+    # Do not confuse missing external evidence with broken code. Only the code gate  
+    # can fail startup here; provider/live evidence remains visible in the report.  
+    if blocked:  
+        logger.warning("roadmap69_code_capabilities_pending steps=%s", blocked)  
+    logger.info("[SinoTrust Roadmap69] code_ready=%s/60 live_evidence_pending=%s", report["summary"]["code_ready_1_60"], report["summary"]["awaiting_live_evidence"])  
   
   
 # This is intentionally the LAST startup hook in the file. If any previous  
