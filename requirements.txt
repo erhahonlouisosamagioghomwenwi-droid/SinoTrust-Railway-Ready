@@ -8,6 +8,7 @@ redis>=6,<7
 boto3>=1.40,<2
 openai>=1.100,<2
 qrcode[pil]>=8,<9
+reportlab>=4.2,<5
 kafka-python>=2.2,<3
 opentelemetry-api>=1.36,<2
 opentelemetry-sdk>=1.36,<2
