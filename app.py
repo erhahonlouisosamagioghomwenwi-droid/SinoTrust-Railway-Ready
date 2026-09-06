@@ -45,6 +45,10 @@ from typing import Optional, Literal
 import importlib.util  
 import sys  
 import io  
+import smtplib  
+import ssl  
+from email.message import EmailMessage  
+from email.utils import formataddr  
   
   
 def _ensure_python_multipart():  
@@ -537,6 +541,18 @@ S3_CONNECT_TIMEOUT = max(1, int(os.getenv("SINOTRUST_S3_CONNECT_TIMEOUT", "4")))
 S3_READ_TIMEOUT = max(2, int(os.getenv("SINOTRUST_S3_READ_TIMEOUT", "15")))  
 NOTIFICATION_GATEWAY_URL = os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_URL", "").strip()  
 NOTIFICATION_GATEWAY_SECRET = os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_SECRET", "").strip()  
+  
+# Real outbound e-mail provider for the Notification Gateway.  
+# Credentials remain environment-only; never hard-code them in this file.  
+SMTP_HOST = os.getenv("SINOTRUST_SMTP_HOST", "").strip()  
+SMTP_PORT = max(1, min(65535, int(os.getenv("SINOTRUST_SMTP_PORT", "587"))))  
+SMTP_USERNAME = os.getenv("SINOTRUST_SMTP_USERNAME", "").strip()  
+SMTP_PASSWORD = os.getenv("SINOTRUST_SMTP_PASSWORD", "")  
+SMTP_FROM_EMAIL = os.getenv("SINOTRUST_SMTP_FROM_EMAIL", SMTP_USERNAME).strip()  
+SMTP_FROM_NAME = os.getenv("SINOTRUST_SMTP_FROM_NAME", "SinoTrust Europe").strip() or "SinoTrust Europe"  
+SMTP_USE_TLS = os.getenv("SINOTRUST_SMTP_USE_TLS", "1") == "1"  
+SMTP_USE_SSL = os.getenv("SINOTRUST_SMTP_USE_SSL", "0") == "1"  
+SMTP_TIMEOUT_SECONDS = max(2, min(60, int(os.getenv("SINOTRUST_SMTP_TIMEOUT_SECONDS", "15"))))  
 WORKER_ENABLED = os.getenv("SINOTRUST_WORKER_ENABLED", "1") == "1"  
 WORKER_POLL_SECONDS = max(1, int(os.getenv("SINOTRUST_WORKER_POLL_SECONDS", "2")))  
 WORKER_BATCH_SIZE = max(1, min(50, int(os.getenv("SINOTRUST_WORKER_BATCH_SIZE", "10"))))  
@@ -3861,16 +3877,12 @@ def deliver_notification_outbox(outbox_id: int):
   
   
 # ============================================================  
-# SINOTRUST NOTIFICATION GATEWAY — SIGNED INTERNAL INGEST  
+# SINOTRUST NOTIFICATION GATEWAY — SIGNED INTERNAL INGEST + REAL EMAIL DELIVERY  
 # ============================================================  
-# This endpoint is intentionally provider-neutral. The main SinoTrust service  
-# POSTs notification-outbox events here using the same HMAC-SHA256 contract  
-# already implemented by deliver_notification_outbox(). The gateway validates  
-# authenticity, input shape and idempotency before accepting the event.  
-#  
-# IMPORTANT: a 2xx response means "accepted by the SinoTrust notification  
-# gateway", not "delivered to the final mailbox". A downstream email/SMS  
-# provider can be attached later without changing the caller contract.  
+# The main SinoTrust service POSTs signed notification-outbox events here.  
+# For email events, this gateway now performs a real SMTP handoff before it  
+# returns 2xx. Therefore the caller marks notification_outbox.status='sent'  
+# only after the configured mail provider has accepted the message.  
 NOTIFICATION_GATEWAY_MAX_BODY_BYTES = max(  
     4096,  
     min(1024 * 1024, int(os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_MAX_BODY_BYTES", str(256 * 1024)))),  
@@ -3880,50 +3892,142 @@ NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS = max(
     min(30 * 24 * 3600, int(os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS", str(7 * 24 * 3600)))),  
 )  
 _NOTIFICATION_GATEWAY_LOCAL_IDS = {}  
+_NOTIFICATION_GATEWAY_LOCAL_PENDING = {}  
   
   
 def _notification_gateway_provider_ref(notification_id: str) -> str:  
-    """Return a deterministic, non-secret acceptance reference."""  
+    """Return a deterministic, non-secret SinoTrust delivery reference."""  
     digest = hashlib.sha256(f"sinotrust-notification:{notification_id}".encode("utf-8")).hexdigest()[:24]  
     return f"STN-{digest.upper()}"  
   
   
-def _notification_gateway_mark_once(notification_id: str) -> tuple[bool, str]:  
-    """Return (first_seen, provider_ref), using Redis when available.  
+def _notification_gateway_begin_delivery(notification_id: str) -> tuple[str, str]:  
+    """Reserve a notification for delivery.  
   
-    The deterministic provider reference makes duplicate retries idempotent even  
-    when the process restarts. Redis, when configured, additionally provides a  
-    shared duplicate gate across Railway replicas.  
+    Returns (state, provider_ref), where state is one of:  
+      - "new": this request owns the delivery attempt;  
+      - "delivered": an earlier attempt already completed successfully;  
+      - "pending": another worker is currently delivering it.  
     """  
     provider_ref = _notification_gateway_provider_ref(notification_id)  
     redis_client = _redis_client()  
+    redis_key = f"sinotrust:notification-gateway:idempotency:{notification_id}"  
     if redis_client is not None:  
         try:  
-            key = f"sinotrust:notification-gateway:idempotency:{notification_id}"  
-            created = bool(  
-                redis_client.set(  
-                    key,  
-                    provider_ref,  
-                    nx=True,  
-                    ex=NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS,  
-                )  
-            )  
-            existing = redis_client.get(key) or provider_ref  
-            return created, str(existing)  
+            existing = redis_client.get(redis_key)  
+            if existing:  
+                existing = str(existing)  
+                if existing.startswith("delivered:"):  
+                    return "delivered", existing.split(":", 1)[1] or provider_ref  
+                return "pending", provider_ref  
+            reserved = bool(redis_client.set(redis_key, f"pending:{provider_ref}", nx=True, ex=120))  
+            if reserved:  
+                return "new", provider_ref  
+            existing = str(redis_client.get(redis_key) or "")  
+            if existing.startswith("delivered:"):  
+                return "delivered", existing.split(":", 1)[1] or provider_ref  
+            return "pending", provider_ref  
         except Exception as exc:  
             logger.warning("notification_gateway_idempotency_redis_failed: %s", exc)  
   
-    # Safe process-local fallback. It is bounded by TTL cleanup and preserves  
-    # idempotency within one replica when Redis is temporarily unavailable.  
     now = time.monotonic()  
-    stale_before = now - NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS  
+    stale_before = now - 120  
+    for key, seen_at in list(_NOTIFICATION_GATEWAY_LOCAL_PENDING.items()):  
+        if seen_at < stale_before:  
+            _NOTIFICATION_GATEWAY_LOCAL_PENDING.pop(key, None)  
+    if notification_id in _NOTIFICATION_GATEWAY_LOCAL_IDS:  
+        return "delivered", provider_ref  
+    if notification_id in _NOTIFICATION_GATEWAY_LOCAL_PENDING:  
+        return "pending", provider_ref  
+    _NOTIFICATION_GATEWAY_LOCAL_PENDING[notification_id] = now  
+    return "new", provider_ref  
+  
+  
+def _notification_gateway_finish_delivery(notification_id: str, provider_ref: str) -> None:  
+    redis_client = _redis_client()  
+    redis_key = f"sinotrust:notification-gateway:idempotency:{notification_id}"  
+    if redis_client is not None:  
+        try:  
+            redis_client.set(  
+                redis_key,  
+                f"delivered:{provider_ref}",  
+                ex=NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS,  
+            )  
+        except Exception as exc:  
+            logger.warning("notification_gateway_idempotency_finish_redis_failed: %s", exc)  
+    _NOTIFICATION_GATEWAY_LOCAL_PENDING.pop(notification_id, None)  
+    _NOTIFICATION_GATEWAY_LOCAL_IDS[notification_id] = time.monotonic()  
     if len(_NOTIFICATION_GATEWAY_LOCAL_IDS) > 4096:  
+        stale_before = time.monotonic() - NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS  
         for key, seen_at in list(_NOTIFICATION_GATEWAY_LOCAL_IDS.items()):  
             if seen_at < stale_before:  
                 _NOTIFICATION_GATEWAY_LOCAL_IDS.pop(key, None)  
-    first_seen = notification_id not in _NOTIFICATION_GATEWAY_LOCAL_IDS  
-    _NOTIFICATION_GATEWAY_LOCAL_IDS[notification_id] = now  
-    return first_seen, provider_ref  
+  
+  
+def _notification_gateway_abort_delivery(notification_id: str) -> None:  
+    redis_client = _redis_client()  
+    redis_key = f"sinotrust:notification-gateway:idempotency:{notification_id}"  
+    if redis_client is not None:  
+        try:  
+            existing = str(redis_client.get(redis_key) or "")  
+            if existing.startswith("pending:"):  
+                redis_client.delete(redis_key)  
+        except Exception as exc:  
+            logger.warning("notification_gateway_idempotency_abort_redis_failed: %s", exc)  
+    _NOTIFICATION_GATEWAY_LOCAL_PENDING.pop(notification_id, None)  
+  
+  
+def _smtp_configuration_ready() -> bool:  
+    return bool(SMTP_HOST and SMTP_FROM_EMAIL)  
+  
+  
+def _deliver_email_via_smtp(  
+    *,  
+    destination: str,  
+    title: str,  
+    message_body: str,  
+    notification_id: str,  
+    provider_ref: str,  
+) -> str:  
+    """Hand one message to the configured SMTP provider.  
+  
+    A successful return means the SMTP server accepted the message. It does not  
+    claim that a remote mailbox has opened/read it; bounces remain provider-side.  
+    """  
+    if not _smtp_configuration_ready():  
+        raise RuntimeError("email_provider_not_configured")  
+    if SMTP_USE_SSL and SMTP_USE_TLS:  
+        raise RuntimeError("smtp_tls_configuration_conflict")  
+  
+    msg = EmailMessage()  
+    msg["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM_EMAIL))  
+    msg["To"] = destination  
+    msg["Subject"] = title  
+    msg["Message-ID"] = f"<{provider_ref.lower()}@sinotrusteurope.com>"  
+    msg["X-SinoTrust-Notification-ID"] = notification_id  
+    msg["X-SinoTrust-Reference"] = provider_ref  
+    msg.set_content(message_body)  
+  
+    context = ssl.create_default_context()  
+    smtp_cls = smtplib.SMTP_SSL if SMTP_USE_SSL else smtplib.SMTP  
+    kwargs = {"host": SMTP_HOST, "port": SMTP_PORT, "timeout": SMTP_TIMEOUT_SECONDS}  
+    if SMTP_USE_SSL:  
+        kwargs["context"] = context  
+  
+    with smtp_cls(**kwargs) as client:  
+        client.ehlo()  
+        if SMTP_USE_TLS:  
+            client.starttls(context=context)  
+            client.ehlo()  
+        if SMTP_USERNAME:  
+            if not SMTP_PASSWORD:  
+                raise RuntimeError("smtp_password_not_configured")  
+            client.login(SMTP_USERNAME, SMTP_PASSWORD)  
+        refused = client.send_message(msg)  
+        if refused:  
+            raise RuntimeError("smtp_recipient_refused")  
+  
+    return provider_ref  
   
   
 @app.post("/api/internal/notification-gateway", include_in_schema=False)  
@@ -3932,20 +4036,9 @@ async def sinotrust_notification_gateway_ingest(
     x_sinotrust_signature: Optional[str] = Header(default=None),  
     x_sinotrust_notification_id: Optional[str] = Header(default=None),  
 ):  
-    """Receive a signed SinoTrust notification-outbox event.  
-  
-    Security contract:  
-    - requires SINOTRUST_NOTIFICATION_GATEWAY_SECRET;  
-    - verifies HMAC-SHA256 over the exact raw request body;  
-    - rejects oversized, malformed or semantically invalid payloads;  
-    - treats duplicate notification IDs idempotently;  
-    - never returns or logs the shared secret or message body.  
-    """  
+    """Validate a signed notification and deliver email through the real provider."""  
     if not NOTIFICATION_GATEWAY_SECRET:  
-        return JSONResponse(  
-            {"error": "notification_gateway_secret_not_configured"},  
-            status_code=503,  
-        )  
+        return JSONResponse({"error": "notification_gateway_secret_not_configured"}, status_code=503)  
   
     content_length = request.headers.get("content-length", "").strip()  
     if content_length:  
@@ -3964,12 +4057,7 @@ async def sinotrust_notification_gateway_ingest(
     supplied_signature = (x_sinotrust_signature or "").strip().lower()  
     if not re.fullmatch(r"[0-9a-f]{64}", supplied_signature):  
         return JSONResponse({"error": "invalid_signature"}, status_code=401)  
-  
-    expected_signature = hmac.new(  
-        NOTIFICATION_GATEWAY_SECRET.encode("utf-8"),  
-        body,  
-        hashlib.sha256,  
-    ).hexdigest()  
+    expected_signature = hmac.new(NOTIFICATION_GATEWAY_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()  
     if not hmac.compare_digest(expected_signature, supplied_signature):  
         return JSONResponse({"error": "invalid_signature"}, status_code=401)  
   
@@ -3992,8 +4080,7 @@ async def sinotrust_notification_gateway_ingest(
     destination = str(payload.get("destination") or "").strip()  
     template = str(payload.get("template") or "").strip()  
     data = payload.get("data")  
-  
-    if channel not in {"email"}:  
+    if channel != "email":  
         return JSONResponse({"error": "unsupported_notification_channel"}, status_code=422)  
     if not destination or len(destination) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", destination):  
         return JSONResponse({"error": "invalid_notification_destination"}, status_code=422)  
@@ -4009,37 +4096,81 @@ async def sinotrust_notification_gateway_ingest(
         return JSONResponse({"error": "invalid_notification_title"}, status_code=422)  
     if not message_body or len(message_body) > 10000:  
         return JSONResponse({"error": "invalid_notification_body"}, status_code=422)  
+    if not _smtp_configuration_ready():  
+        logger.error("notification_gateway_email_provider_not_configured")  
+        return JSONResponse({"error": "email_provider_not_configured"}, status_code=503)  
   
-    first_seen, provider_ref = _notification_gateway_mark_once(notification_id)  
+    state, provider_ref = _notification_gateway_begin_delivery(notification_id)  
+    if state == "delivered":  
+        return JSONResponse(  
+            {  
+                "ok": True,  
+                "accepted": True,  
+                "delivered_to_provider": True,  
+                "duplicate": True,  
+                "notification_id": notification_id,  
+                "provider_reference": provider_ref,  
+            },  
+            status_code=200,  
+            headers={"X-Provider-Reference": provider_ref, "Cache-Control": "no-store"},  
+        )  
+    if state == "pending":  
+        return JSONResponse(  
+            {"error": "notification_delivery_in_progress", "notification_id": notification_id},  
+            status_code=409,  
+            headers={"Retry-After": "2", "Cache-Control": "no-store"},  
+        )  
   
+    try:  
+        await asyncio.to_thread(  
+            _deliver_email_via_smtp,  
+            destination=destination,  
+            title=title,  
+            message_body=message_body,  
+            notification_id=notification_id,  
+            provider_ref=provider_ref,  
+        )  
+    except Exception as exc:  
+        _notification_gateway_abort_delivery(notification_id)  
+        logger.error(  
+            json.dumps(  
+                {  
+                    "event": "notification_gateway_email_delivery_failed",  
+                    "notification_id": notification_id,  
+                    "provider_ref": provider_ref,  
+                    "error_type": type(exc).__name__,  
+                },  
+                ensure_ascii=False,  
+            )  
+        )  
+        return JSONResponse({"error": "email_delivery_failed"}, status_code=502, headers={"Cache-Control": "no-store"})  
+  
+    _notification_gateway_finish_delivery(notification_id, provider_ref)  
     logger.info(  
         json.dumps(  
             {  
-                "event": "notification_gateway_accepted",  
+                "event": "notification_gateway_email_delivered_to_provider",  
                 "notification_id": notification_id,  
                 "provider_ref": provider_ref,  
                 "channel": channel,  
                 "template": template,  
                 "locale": locale,  
-                "duplicate": not first_seen,  
+                "duplicate": False,  
             },  
             ensure_ascii=False,  
         )  
     )  
-  
     return JSONResponse(  
         {  
             "ok": True,  
             "accepted": True,  
-            "duplicate": not first_seen,  
+            "delivered_to_provider": True,  
+            "duplicate": False,  
             "notification_id": notification_id,  
             "provider_reference": provider_ref,  
         },  
         status_code=202,  
-        headers={  
-            "X-Provider-Reference": provider_ref,  
-            "Cache-Control": "no-store",  
-        },  
+        headers={"X-Provider-Reference": provider_ref, "Cache-Control": "no-store"},  
     )  
   
   
