@@ -3198,28 +3198,96 @@ def extract_document_text(path):
     return ""  
   
 async def ai_review_case(case_id):  
+    """Run the AI document pre-review with fail-closed extraction semantics.  
+  
+    A provider response is considered ``completed`` only when at least one document  
+    exists and every document selected for the review produced machine-readable  
+    text.  Image-only/scanned PDFs therefore never become a false ``completed``  
+    result with score 0: they are routed to ``needs_review`` and require OCR or  
+    human review. Provider/runtime failures remain ``unavailable``.  
+    """  
     with db_conn() as db:  
-        case=db.execute("SELECT c.*,p.name product_name,p.category,co.name company_name FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=?",(case_id,)).fetchone()  
+        case=db.execute(  
+            "SELECT c.*,p.name product_name,p.category,co.name company_name "  
+            "FROM cases c JOIN products p ON p.id=c.product_id "  
+            "JOIN companies co ON co.id=p.company_id WHERE c.id=?",  
+            (case_id,),  
+        ).fetchone()  
         docs=db.execute("SELECT * FROM documents WHERE case_id=? ORDER BY id",(case_id,)).fetchall()  
     if not case:  
         return None  
   
     excerpts=[]  
     used_chars=0  
-    for d in docs[:AI_MAX_DOCUMENTS]:  
+    reviewed_docs=list(docs[:AI_MAX_DOCUMENTS])  
+    readable_docs=[]  
+    unreadable_docs=[]  
+  
+    for d in reviewed_docs:  
         local_path = materialize_registered_object(  
             "document",  
             d["id"],  
             os.path.join(UPLOAD_DIR, d["stored_name"]),  
         )  
         txt=extract_document_text(local_path)  
+        # Treat whitespace/control-only extraction as unreadable. This avoids  
+        # sending placeholder text to the model and then mistaking score=0 for a  
+        # successful pre-review.  
+        machine_text=(txt or "").strip()  
+        if machine_text:  
+            readable_docs.append(d)  
+        else:  
+            unreadable_docs.append(d)  
+  
         remaining=max(0,AI_MAX_CONTEXT_CHARS-used_chars)  
         if remaining <= 0:  
             break  
-        excerpt=(txt[:min(12000,remaining)] if txt else "[No machine-readable text extracted]")  
+        excerpt=(machine_text[:min(12000,remaining)] if machine_text else "[No machine-readable text extracted]")  
         rendered=f"DOCUMENT: {d['original_name']}\n{excerpt}"  
         excerpts.append(rendered)  
         used_chars += len(rendered)  
+  
+    # Fail closed before the provider call when there is no usable text. The  
+    # previous implementation still called the model with placeholders; a valid  
+    # structured response such as score=0 was then persisted as ai_status=completed.  
+    if not reviewed_docs or not readable_docs:  
+        if not reviewed_docs:  
+            summary=(  
+                "AI pre-review could not be completed because no documents were available. "  
+                "Upload the required company/product documents before review. Human review remains available."  
+            )  
+            missing=["At least one reviewable document is required."]  
+        else:  
+            summary=(  
+                "AI pre-review could not be completed because the submitted documents contain no "  
+                "machine-readable text. Provide OCR-enabled/searchable copies or use human review of "  
+                "the originals. This pre-review is decision support only and is not legal certification."  
+            )  
+            missing=[f"OCR/searchable text required: {d['original_name']}" for d in unreadable_docs[:30]]  
+  
+        normalized={  
+            "status":"needs_review",  
+            "score":None,  
+            "summary":summary,  
+            "missing":missing,  
+            "risk":"unknown",  
+            "documents_reviewed":len(reviewed_docs),  
+            "documents_readable":len(readable_docs),  
+            "documents_unreadable":len(unreadable_docs),  
+        }  
+        with db_conn() as db:  
+            db.execute(  
+                "UPDATE cases SET ai_status=?,ai_score=?,ai_summary=?,updated_at=? WHERE id=?",  
+                ("needs_review",None,summary,iso_now(),case_id),  
+            )  
+            encoded=json.dumps(normalized,ensure_ascii=False)  
+            for d in docs:  
+                db.execute("UPDATE documents SET ai_result=? WHERE id=?",(encoded,d["id"]))  
+        logger.info(  
+            "ai_pre_review_needs_review case_id=%s documents=%s readable=%s unreadable=%s",  
+            case_id, len(reviewed_docs), len(readable_docs), len(unreadable_docs),  
+        )  
+        return normalized  
   
     prompt=(  
         "You are SinoTrust's document pre-review engine. This is decision support only; never claim legal certification. "  
@@ -3330,9 +3398,11 @@ async def ai_review_case(case_id):
             timeout=AI_PROVIDER_TIMEOUT_SECONDS + 2,  
         )  
   
+    provider_failed=False  
     try:  
         result=await _call_openai_pre_review()  
     except Exception as e:  
+        provider_failed=True  
         # Never expose credentials. Keep a concise diagnostic in logs and a safe status in DB.  
         logger.error("ai_pre_review_failed case_id=%s model=%s error=%s: %s",  
                      case_id, model, type(e).__name__, str(e)[:500])  
@@ -3356,14 +3426,48 @@ async def ai_review_case(case_id):
     if risk not in {"low","medium","high","unknown"}:  
         risk="unknown"  
     summary=str(result.get("summary") or "")[:5000]  
-    normalized={"score":score,"summary":summary,"missing":[str(x)[:300] for x in missing[:30]],"risk":risk}  
+  
+    # If only a subset of selected documents was readable, the model output is  
+    # useful as decision support but cannot represent a completed whole-case review.  
+    extraction_incomplete=bool(unreadable_docs)  
+    if provider_failed or score is None:  
+        ai_status="unavailable"  
+        persisted_score=None  
+    elif extraction_incomplete:  
+        ai_status="needs_review"  
+        persisted_score=None  
+        missing=[str(x)[:300] for x in missing[:30]]  
+        for d in unreadable_docs:  
+            note=f"OCR/searchable text required: {d['original_name']}"  
+            if note not in missing and len(missing) < 30:  
+                missing.append(note)  
+        summary=(summary + " " if summary else "") + (  
+            "Pre-review is incomplete because one or more submitted documents had no machine-readable text; "  
+            "OCR-enabled copies or human review are required."  
+        )  
+        summary=summary[:5000]  
+    else:  
+        ai_status="completed"  
+        persisted_score=score  
+  
+    normalized={  
+        "status":ai_status,  
+        "score":persisted_score,  
+        "summary":summary,  
+        "missing":[str(x)[:300] for x in missing[:30]],  
+        "risk":risk,  
+        "documents_reviewed":len(reviewed_docs),  
+        "documents_readable":len(readable_docs),  
+        "documents_unreadable":len(unreadable_docs),  
+    }  
     with db_conn() as db:  
         db.execute(  
             "UPDATE cases SET ai_status=?,ai_score=?,ai_summary=?,updated_at=? WHERE id=?",  
-            ("completed" if score is not None else "unavailable",score,summary,iso_now(),case_id),  
+            (ai_status,persisted_score,summary,iso_now(),case_id),  
         )  
+        encoded=json.dumps(normalized,ensure_ascii=False)  
         for d in docs:  
-            db.execute("UPDATE documents SET ai_result=? WHERE id=?",(json.dumps(normalized,ensure_ascii=False),d["id"]))  
+            db.execute("UPDATE documents SET ai_result=? WHERE id=?",(encoded,d["id"]))  
     return normalized  
   
   
