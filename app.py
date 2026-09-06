@@ -2660,6 +2660,36 @@ def require_org(request: Request, permission: str = "org.read"):
         raise PermissionError("forbidden")  
     return u, dict(org)  
   
+def authorize_case_access(request: Request, case_id: int, permission: str = "org.read", *, allow_privileged: bool = False):  
+    """Authorize access to a case without trusting client-supplied entity IDs.  
+  
+    Normal customer/API-key access is always resolved through organization membership  
+    and then scoped by organization_id. Reviewer/admin bypass is explicit and opt-in  
+    for workflows that are intentionally cross-tenant. A missing foreign-tenant case  
+    is reported by callers as 404 to avoid leaking resource existence.  
+    """  
+    user = require_user(request)  
+    if allow_privileged and user.get("role") in {"reviewer", "admin"}:  
+        with db_conn() as db:  
+            case = db.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()  
+        return user, None, dict(case) if case else None  
+  
+    requested = request.headers.get("x-sinotrust-org")  
+    try:  
+        requested_id = int(requested) if requested else None  
+    except ValueError:  
+        raise PermissionError("invalid_organization")  
+  
+    with db_conn() as db:  
+        org = resolve_organization(db, user["id"], requested_id)  
+        if not org:  
+            raise PermissionError("organization_required")  
+        if not org_permission(org["member_role"], permission):  
+            raise PermissionError("forbidden")  
+        case = owns_case_org(db, org["id"], case_id)  
+    return user, dict(org), dict(case) if case else None  
+  
+  
 def subscription_for_org(db, organization_id: int):  
     row = db.execute("SELECT * FROM subscriptions WHERE organization_id=?", (organization_id,)).fetchone()  
     return dict(row) if row else None  
@@ -16103,13 +16133,11 @@ async def level12_admin_create_policy(payload: Level12PolicyPayload, request: Re
 @app.post("/api/cases/{case_id}/level12/evaluate", include_in_schema=False)  
 async def level12_case_evaluate(case_id: int, payload: Level12EvaluatePayload, request: Request):  
     try:  
-        u = require_user(request)  
-    except PermissionError:  
-        return JSONResponse({"error": "authentication_required"}, status_code=401)  
-    with db_conn() as db:  
-        owned = owns_case(db, u["id"], case_id)  
-        if not owned and u.get("role") not in {"reviewer", "admin"}:  
-            return JSONResponse({"error": "case_not_found"}, status_code=404)  
+        u, _org, owned = authorize_case_access(request, case_id, "case.manage", allow_privileged=True)  
+    except PermissionError as exc:  
+        return JSONResponse({"error": str(exc)}, status_code=403 if str(exc) == "forbidden" else 401)  
+    if not owned:  
+        return JSONResponse({"error": "case_not_found"}, status_code=404)  
     try:  
         result = level12_evaluate_case(case_id, payload.policy_id)  
     except ValueError as exc:  
@@ -16121,13 +16149,11 @@ async def level12_case_evaluate(case_id: int, payload: Level12EvaluatePayload, r
 @app.get("/api/cases/{case_id}/level12/evaluations", include_in_schema=False)  
 async def level12_case_evaluations(case_id: int, request: Request):  
     try:  
-        u = require_user(request)  
-    except PermissionError:  
-        return JSONResponse({"error": "authentication_required"}, status_code=401)  
-    with db_conn() as db:  
-        owned = owns_case(db, u["id"], case_id)  
-        if not owned and u.get("role") not in {"reviewer", "admin"}:  
-            return JSONResponse({"error": "case_not_found"}, status_code=404)  
+        u, _org, owned = authorize_case_access(request, case_id, "case.manage", allow_privileged=True)  
+    except PermissionError as exc:  
+        return JSONResponse({"error": str(exc)}, status_code=403 if str(exc) == "forbidden" else 401)  
+    if not owned:  
+        return JSONResponse({"error": "case_not_found"}, status_code=404)  
         rows = [dict(x) for x in db.execute(  
             "SELECT e.*,p.policy_key,p.policy_version,p.name policy_name FROM policy_evaluations e JOIN compliance_policies p ON p.id=e.policy_id WHERE e.case_id=? ORDER BY e.id DESC",  
             (case_id,),  
@@ -16618,13 +16644,11 @@ async def level13_case_issue_passport(case_id: int, payload: Level13PassportIssu
     if live_block is not None:  
         return live_block  
     try:  
-        user = require_user(request)  
-    except PermissionError:  
-        return JSONResponse({"error": "authentication_required"}, status_code=401)  
-    with db_conn() as db:  
-        owned = owns_case(db, user["id"], case_id)  
-        if not owned and user.get("role") not in {"reviewer", "admin"}:  
-            return JSONResponse({"error": "case_not_found"}, status_code=404)  
+        user, _org, owned = authorize_case_access(request, case_id, "case.manage", allow_privileged=True)  
+    except PermissionError as exc:  
+        return JSONResponse({"error": str(exc)}, status_code=403 if str(exc) == "forbidden" else 401)  
+    if not owned:  
+        return JSONResponse({"error": "case_not_found"}, status_code=404)  
     try:  
         result = level13_issue_or_refresh_passport(case_id, user.get("id"))  
     except ValueError as exc:  
@@ -16636,13 +16660,11 @@ async def level13_case_issue_passport(case_id: int, payload: Level13PassportIssu
 @app.get("/api/cases/{case_id}/level13/trust-passport", include_in_schema=False)  
 async def level13_case_get_passport(case_id: int, request: Request):  
     try:  
-        user = require_user(request)  
-    except PermissionError:  
-        return JSONResponse({"error": "authentication_required"}, status_code=401)  
-    with db_conn() as db:  
-        owned = owns_case(db, user["id"], case_id)  
-        if not owned and user.get("role") not in {"reviewer", "admin"}:  
-            return JSONResponse({"error": "case_not_found"}, status_code=404)  
+        user, _org, owned = authorize_case_access(request, case_id, "case.manage", allow_privileged=True)  
+    except PermissionError as exc:  
+        return JSONResponse({"error": str(exc)}, status_code=403 if str(exc) == "forbidden" else 401)  
+    if not owned:  
+        return JSONResponse({"error": "case_not_found"}, status_code=404)  
         row = db.execute("SELECT passport_id FROM trust_passports WHERE case_id=?", (case_id,)).fetchone()  
     if not row:  
         return JSONResponse({"error": "trust_passport_not_found"}, status_code=404)  
