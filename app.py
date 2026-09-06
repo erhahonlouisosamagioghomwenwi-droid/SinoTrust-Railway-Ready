@@ -13336,9 +13336,12 @@ async def saas_case(payload: CasePayload, request: Request):
 @app.post("/api/saas/cases/{case_id}/documents", include_in_schema=False)  
 async def saas_upload(case_id:int, request:Request, file:UploadFile=File(...)):  
     try:  
-        u,org=require_org(request,"case.manage")  
+        u, org, scoped_case = authorize_case_access(request, case_id, "case.manage")  
     except PermissionError as exc:  
         return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not scoped_case:  
+        # Deliberately return 404 for a foreign-tenant id: never disclose whether it exists.  
+        return JSONResponse({"error":"Case not found."},404)  
   
     safe_name = _safe_upload_filename(file.filename or "document")  
     ext = Path(safe_name).suffix.lower()  
@@ -13357,10 +13360,6 @@ async def saas_upload(case_id:int, request:Request, file:UploadFile=File(...)):
         return JSONResponse({"error":"File content does not match the declared file type."},415)  
     if not _client_mime_matches(ext, file.content_type or ""):  
         return JSONResponse({"error":"File MIME type does not match the file extension."},415)  
-  
-    with db_conn() as db:  
-        if not owns_case_org(db,org['id'],case_id):  
-            return JSONResponse({"error":"Case not found."},404)  
   
     sha = hashlib.sha256(data).hexdigest()  
     # Recover cleanly from a previous partially failed upload.  Older builds could  
@@ -13496,11 +13495,10 @@ async def saas_submit(case_id:int, request:Request, background_tasks: Background
     live_block = require_live_operation("case_submission")  
     if live_block is not None:  
         return live_block  
-    try: u,org=require_org(request,"case.manage")  
+    try: u,org,c=authorize_case_access(request,case_id,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not c: return JSONResponse({"error":"Case not found."},404)  
     with db_conn() as db:  
-        c=owns_case_org(db,org['id'],case_id)  
-        if not c: return JSONResponse({"error":"Case not found."},404)  
         if c['status'] not in {'draft','changes_requested'}: return JSONResponse({"error":"Case cannot be submitted from its current status."},409)  
         n=db.execute("SELECT COUNT(*) n FROM documents WHERE case_id=?",(case_id,)).fetchone()['n']  
         if not n: return JSONResponse({"error":"Upload at least one document before submission."},400)  
@@ -13529,21 +13527,19 @@ async def saas_submit(case_id:int, request:Request, background_tasks: Background
   
 @app.post("/api/saas/cases/{case_id}/ai-review", include_in_schema=False)  
 async def saas_ai_review(case_id:int, request:Request):  
-    try: u,org=require_org(request,"case.manage")  
+    try: u,org,c=authorize_case_access(request,case_id,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not c: return JSONResponse({"error":"Case not found."},404)  
     with db_conn() as db:  
-        if not owns_case_org(db,org['id'],case_id): return JSONResponse({"error":"Case not found."},404)  
         db.execute("UPDATE cases SET ai_status='processing' WHERE id=?",(case_id,))  
     result=await ai_review_case(case_id); audit(u['id'],"ai_review","case",case_id); return result  
   
 @app.post("/api/saas/cases/{case_id}/payments", include_in_schema=False)  
 async def saas_payment(case_id:int,payload:PaymentPayload,request:Request):  
-    try: u,org=require_org(request,"billing.manage")  
+    try: u,org,c=authorize_case_access(request,case_id,"billing.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
-    with db_conn() as db:  
-        c=owns_case_org(db,org['id'],case_id)  
-        if not c: return JSONResponse({"error":"Case not found."},404)  
-        amount=PLAN_PRICES[c['plan']]  
+    if not c: return JSONResponse({"error":"Case not found."},404)  
+    amount=PLAN_PRICES[c['plan']]  
   
     ref=("DEMO-PAY-" if IS_DEMO_MODE else "STP-")+uuid.uuid4().hex[:18].upper()  
   
@@ -13827,9 +13823,11 @@ async def public_verify(code:str):
 @app.get("/api/saas/cases/{case_id}/verification-qr.png", include_in_schema=False)  
 async def case_verification_qr(case_id:int,request:Request):  
     try:  
-        u,org=require_org(request,"org.read")  
+        u,org,scoped_case=authorize_case_access(request,case_id,"org.read")  
     except PermissionError as exc:  
         return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not scoped_case:  
+        return JSONResponse({"error":"Approved verification record not found."},404)  
     with db_conn() as db:  
         r=db.execute(  
             "SELECT c.verification_code,c.status,c.expires_at "  
@@ -13870,8 +13868,9 @@ async def case_verification_qr(case_id:int,request:Request):
   
 @app.get("/api/saas/cases/{case_id}/certificate", include_in_schema=False)  
 async def certificate(case_id:int,request:Request):  
-    try: u,org=require_org(request,"case.manage")  
+    try: u,org,scoped_case=authorize_case_access(request,case_id,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not scoped_case: return JSONResponse({"error":"Verification record not found."},404)  
     with db_conn() as db: r=db.execute("SELECT c.*,p.name product_name,p.model,p.category,co.name company_name,co.country FROM cases c JOIN products p ON p.id=c.product_id JOIN companies co ON co.id=p.company_id WHERE c.id=? AND co.organization_id=? AND c.status IN ('approved','expired','revoked')",(case_id,org['id'])).fetchone()  
     if not r: return JSONResponse({"error":"Verification record not found."},404)  
     code=str(r["verification_code"] or "")  
@@ -13900,11 +13899,11 @@ async def directory(q:str="",country:str="",category:str=""):
   
 @app.post("/api/saas/cases/{case_id}/renew", include_in_schema=False)  
 async def renew_case(case_id:int,request:Request):  
-    try: u,org=require_org(request,"case.manage")  
+    try: u,org,old=authorize_case_access(request,case_id,"case.manage")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not old: return JSONResponse({"error":"Case not found."},404)  
+    if old['status']!='approved': return JSONResponse({"error":"Only approved cases can be renewed."},400)  
     with db_conn() as db:  
-        old=owns_case_org(db,org['id'],case_id)  
-        if not old or old['status']!='approved': return JSONResponse({"error":"Only approved cases can be renewed."},400)  
         cur=db.execute("INSERT INTO cases(product_id,plan,status,processing_region,created_at,updated_at) VALUES(?,?,?,?,?,?)",(old['product_id'],old['plan'],'draft',DEPLOYMENT_REGION,iso_now(),iso_now())); new_id=cur.lastrowid  
     notify(u['id'],"Renewal started",f"Renewal case #{new_id} created from #{case_id}."); meter_usage(org['id'],"cases",1,"case",new_id); queue_enterprise_event(org['id'],"case.renewal_created",{"case_id":new_id,"source_case_id":case_id}); return {"id":new_id}  
   
@@ -13921,10 +13920,10 @@ async def saas_logout(request:Request):
   
 @app.get("/api/saas/cases/{case_id}/timeline", include_in_schema=False)  
 async def case_timeline(case_id:int,request:Request):  
-    try: u,org=require_org(request,"org.read")  
+    try: u,org,scoped_case=authorize_case_access(request,case_id,"org.read")  
     except PermissionError as exc: return JSONResponse({"error":str(exc)},403 if str(exc)=="forbidden" else 401)  
+    if not scoped_case: return JSONResponse({"error":"Case not found."},404)  
     with db_conn() as db:  
-        if not owns_case_org(db,org['id'],case_id): return JSONResponse({"error":"Case not found."},404)  
         rows=[dict(x) for x in db.execute("SELECT event_type,from_status,to_status,detail,created_at FROM case_events WHERE case_id=? ORDER BY id",(case_id,))]  
     return {"events":rows}  
   
