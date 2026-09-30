@@ -45,10 +45,6 @@ from typing import Optional, Literal
 import importlib.util  
 import sys  
 import io  
-import smtplib  
-import ssl  
-from email.message import EmailMessage  
-from email.utils import formataddr  
   
   
 def _ensure_python_multipart():  
@@ -543,16 +539,15 @@ NOTIFICATION_GATEWAY_URL = os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_URL", "").s
 NOTIFICATION_GATEWAY_SECRET = os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_SECRET", "").strip()  
   
 # Real outbound e-mail provider for the Notification Gateway.  
-# Credentials remain environment-only; never hard-code them in this file.  
-SMTP_HOST = os.getenv("SINOTRUST_SMTP_HOST", "").strip()  
-SMTP_PORT = max(1, min(65535, int(os.getenv("SINOTRUST_SMTP_PORT", "587"))))  
-SMTP_USERNAME = os.getenv("SINOTRUST_SMTP_USERNAME", "").strip()  
-SMTP_PASSWORD = os.getenv("SINOTRUST_SMTP_PASSWORD", "")  
-SMTP_FROM_EMAIL = os.getenv("SINOTRUST_SMTP_FROM_EMAIL", SMTP_USERNAME).strip()  
-SMTP_FROM_NAME = os.getenv("SINOTRUST_SMTP_FROM_NAME", "SinoTrust Europe").strip() or "SinoTrust Europe"  
-SMTP_USE_TLS = os.getenv("SINOTRUST_SMTP_USE_TLS", "1") == "1"  
-SMTP_USE_SSL = os.getenv("SINOTRUST_SMTP_USE_SSL", "0") == "1"  
-SMTP_TIMEOUT_SECONDS = max(2, min(60, int(os.getenv("SINOTRUST_SMTP_TIMEOUT_SECONDS", "15"))))  
+# Railway may restrict direct SMTP egress on some plans, therefore production  
+# delivery uses Resend's HTTPS API. Credentials remain environment-only.  
+# During the SMTP -> HTTPS migration the existing SMTP password can be reused  
+# as the Resend API key, so no secret has to be copied through source control.  
+RESEND_API_URL = os.getenv("SINOTRUST_RESEND_API_URL", "https://api.resend.com/emails").strip() or "https://api.resend.com/emails"  
+RESEND_API_KEY = os.getenv("SINOTRUST_RESEND_API_KEY", os.getenv("SINOTRUST_SMTP_PASSWORD", "")).strip()  
+EMAIL_FROM_EMAIL = os.getenv("SINOTRUST_EMAIL_FROM_EMAIL", os.getenv("SINOTRUST_SMTP_FROM_EMAIL", "")).strip()  
+EMAIL_FROM_NAME = os.getenv("SINOTRUST_EMAIL_FROM_NAME", os.getenv("SINOTRUST_SMTP_FROM_NAME", "SinoTrust Europe")).strip() or "SinoTrust Europe"  
+EMAIL_PROVIDER_TIMEOUT_SECONDS = max(2, min(60, int(os.getenv("SINOTRUST_EMAIL_PROVIDER_TIMEOUT_SECONDS", "15"))))  
 WORKER_ENABLED = os.getenv("SINOTRUST_WORKER_ENABLED", "1") == "1"  
 WORKER_POLL_SECONDS = max(1, int(os.getenv("SINOTRUST_WORKER_POLL_SECONDS", "2")))  
 WORKER_BATCH_SIZE = max(1, min(50, int(os.getenv("SINOTRUST_WORKER_BATCH_SIZE", "10"))))  
@@ -3880,9 +3875,10 @@ def deliver_notification_outbox(outbox_id: int):
 # SINOTRUST NOTIFICATION GATEWAY — SIGNED INTERNAL INGEST + REAL EMAIL DELIVERY  
 # ============================================================  
 # The main SinoTrust service POSTs signed notification-outbox events here.  
-# For email events, this gateway now performs a real SMTP handoff before it  
-# returns 2xx. Therefore the caller marks notification_outbox.status='sent'  
-# only after the configured mail provider has accepted the message.  
+# For email events, this gateway performs a real HTTPS handoff to Resend before  
+# returning 2xx. Therefore notification_outbox.status='sent' is recorded only  
+# after the provider API has accepted the message. Provider-side idempotency is  
+# also used so retries cannot create duplicate transactional emails.  
 NOTIFICATION_GATEWAY_MAX_BODY_BYTES = max(  
     4096,  
     min(1024 * 1024, int(os.getenv("SINOTRUST_NOTIFICATION_GATEWAY_MAX_BODY_BYTES", str(256 * 1024)))),  
@@ -3936,6 +3932,9 @@ def _notification_gateway_begin_delivery(notification_id: str) -> tuple[str, str
         if seen_at < stale_before:  
             _NOTIFICATION_GATEWAY_LOCAL_PENDING.pop(key, None)  
     if notification_id in _NOTIFICATION_GATEWAY_LOCAL_IDS:  
+        stored = _NOTIFICATION_GATEWAY_LOCAL_IDS[notification_id]  
+        if isinstance(stored, tuple) and len(stored) == 2:  
+            return "delivered", str(stored[0] or provider_ref)  
         return "delivered", provider_ref  
     if notification_id in _NOTIFICATION_GATEWAY_LOCAL_PENDING:  
         return "pending", provider_ref  
@@ -3956,10 +3955,11 @@ def _notification_gateway_finish_delivery(notification_id: str, provider_ref: st
         except Exception as exc:  
             logger.warning("notification_gateway_idempotency_finish_redis_failed: %s", exc)  
     _NOTIFICATION_GATEWAY_LOCAL_PENDING.pop(notification_id, None)  
-    _NOTIFICATION_GATEWAY_LOCAL_IDS[notification_id] = time.monotonic()  
+    _NOTIFICATION_GATEWAY_LOCAL_IDS[notification_id] = (provider_ref, time.monotonic())  
     if len(_NOTIFICATION_GATEWAY_LOCAL_IDS) > 4096:  
         stale_before = time.monotonic() - NOTIFICATION_GATEWAY_IDEMPOTENCY_TTL_SECONDS  
-        for key, seen_at in list(_NOTIFICATION_GATEWAY_LOCAL_IDS.items()):  
+        for key, stored in list(_NOTIFICATION_GATEWAY_LOCAL_IDS.items()):  
+            seen_at = stored[1] if isinstance(stored, tuple) and len(stored) == 2 else stored  
             if seen_at < stale_before:  
                 _NOTIFICATION_GATEWAY_LOCAL_IDS.pop(key, None)  
   
@@ -3977,11 +3977,26 @@ def _notification_gateway_abort_delivery(notification_id: str) -> None:
     _NOTIFICATION_GATEWAY_LOCAL_PENDING.pop(notification_id, None)  
   
   
-def _smtp_configuration_ready() -> bool:  
-    return bool(SMTP_HOST and SMTP_FROM_EMAIL)  
+def _email_provider_configuration_ready() -> bool:  
+    return bool(RESEND_API_KEY and EMAIL_FROM_EMAIL and RESEND_API_URL.startswith("https://"))  
   
   
-def _deliver_email_via_smtp(  
+class EmailProviderError(RuntimeError):  
+    """Sanitized provider failure safe to persist in notification_outbox."""  
+  
+    def __init__(self, code: str, *, status: Optional[int] = None, retry_after: Optional[str] = None):  
+        self.code = str(code or "email_provider_error")[:120]  
+        self.status = status  
+        self.retry_after = (str(retry_after)[:32] if retry_after else None)  
+        detail = self.code  
+        if status is not None:  
+            detail += f":http_{int(status)}"  
+        if self.retry_after:  
+            detail += f":retry_after_{self.retry_after}"  
+        super().__init__(detail)  
+  
+  
+def _deliver_email_via_resend(  
     *,  
     destination: str,  
     title: str,  
@@ -3989,45 +4004,71 @@ def _deliver_email_via_smtp(
     notification_id: str,  
     provider_ref: str,  
 ) -> str:  
-    """Hand one message to the configured SMTP provider.  
+    """Submit one transactional email to Resend over HTTPS.  
   
-    A successful return means the SMTP server accepted the message. It does not  
-    claim that a remote mailbox has opened/read it; bounces remain provider-side.  
+    A successful return means Resend accepted the message and returned its email  
+    identifier. Final mailbox delivery/bounce state is intentionally a separate  
+    concern that can be reconciled later through provider webhooks.  
     """  
-    if not _smtp_configuration_ready():  
-        raise RuntimeError("email_provider_not_configured")  
-    if SMTP_USE_SSL and SMTP_USE_TLS:  
-        raise RuntimeError("smtp_tls_configuration_conflict")  
+    if not _email_provider_configuration_ready():  
+        raise EmailProviderError("email_provider_not_configured")  
   
-    msg = EmailMessage()  
-    msg["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM_EMAIL))  
-    msg["To"] = destination  
-    msg["Subject"] = title  
-    msg["Message-ID"] = f"<{provider_ref.lower()}@sinotrusteurope.com>"  
-    msg["X-SinoTrust-Notification-ID"] = notification_id  
-    msg["X-SinoTrust-Reference"] = provider_ref  
-    msg.set_content(message_body)  
+    from_value = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_EMAIL}>" if EMAIL_FROM_NAME else EMAIL_FROM_EMAIL  
+    payload = json.dumps(  
+        {  
+            "from": from_value,  
+            "to": [destination],  
+            "subject": title,  
+            "text": message_body,  
+            "headers": {  
+                "X-SinoTrust-Notification-ID": notification_id,  
+                "X-SinoTrust-Reference": provider_ref,  
+            },  
+        },  
+        ensure_ascii=False,  
+        separators=(",", ":"),  
+    ).encode("utf-8")  
   
-    context = ssl.create_default_context()  
-    smtp_cls = smtplib.SMTP_SSL if SMTP_USE_SSL else smtplib.SMTP  
-    kwargs = {"host": SMTP_HOST, "port": SMTP_PORT, "timeout": SMTP_TIMEOUT_SECONDS}  
-    if SMTP_USE_SSL:  
-        kwargs["context"] = context  
+    # Stable across retries for the same outbox notification. Resend retains  
+    # idempotency keys for its documented retry window and rejects payload drift.  
+    idempotency_key = f"sinotrust-notification/{notification_id}"[:256]  
+    request = urllib.request.Request(  
+        RESEND_API_URL,  
+        data=payload,  
+        method="POST",  
+        headers={  
+            "Authorization": f"Bearer {RESEND_API_KEY}",  
+            "Content-Type": "application/json",  
+            "Accept": "application/json",  
+            "Idempotency-Key": idempotency_key,  
+            "User-Agent": "SinoTrust-Europe/1.0 Notification-Gateway",  
+        },  
+    )  
   
-    with smtp_cls(**kwargs) as client:  
-        client.ehlo()  
-        if SMTP_USE_TLS:  
-            client.starttls(context=context)  
-            client.ehlo()  
-        if SMTP_USERNAME:  
-            if not SMTP_PASSWORD:  
-                raise RuntimeError("smtp_password_not_configured")  
-            client.login(SMTP_USERNAME, SMTP_PASSWORD)  
-        refused = client.send_message(msg)  
-        if refused:  
-            raise RuntimeError("smtp_recipient_refused")  
+    try:  
+        with urllib.request.urlopen(request, timeout=EMAIL_PROVIDER_TIMEOUT_SECONDS) as response:  
+            status = int(getattr(response, "status", response.getcode()))  
+            raw = response.read(64 * 1024)  
+    except urllib.error.HTTPError as exc:  
+        # Never persist/log provider response bodies: they may contain addresses or  
+        # other customer data. Status + Retry-After are enough for operations.  
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None  
+        raise EmailProviderError("resend_http_error", status=int(exc.code), retry_after=retry_after) from exc  
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:  
+        raise EmailProviderError(f"resend_transport_{type(exc).__name__.lower()}") from exc  
   
-    return provider_ref  
+    if status < 200 or status >= 300:  
+        raise EmailProviderError("resend_unexpected_status", status=status)  
+  
+    try:  
+        response_data = json.loads(raw.decode("utf-8")) if raw else {}  
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:  
+        raise EmailProviderError("resend_invalid_response") from exc  
+  
+    resend_id = str(response_data.get("id") or "").strip() if isinstance(response_data, dict) else ""  
+    if not resend_id or len(resend_id) > 200:  
+        raise EmailProviderError("resend_missing_email_id")  
+    return resend_id  
   
   
 @app.post("/api/internal/notification-gateway", include_in_schema=False)  
@@ -4096,7 +4137,7 @@ async def sinotrust_notification_gateway_ingest(
         return JSONResponse({"error": "invalid_notification_title"}, status_code=422)  
     if not message_body or len(message_body) > 10000:  
         return JSONResponse({"error": "invalid_notification_body"}, status_code=422)  
-    if not _smtp_configuration_ready():  
+    if not _email_provider_configuration_ready():  
         logger.error("notification_gateway_email_provider_not_configured")  
         return JSONResponse({"error": "email_provider_not_configured"}, status_code=503)  
   
@@ -4122,8 +4163,8 @@ async def sinotrust_notification_gateway_ingest(
         )  
   
     try:  
-        await asyncio.to_thread(  
-            _deliver_email_via_smtp,  
+        provider_ref = await asyncio.to_thread(  
+            _deliver_email_via_resend,  
             destination=destination,  
             title=title,  
             message_body=message_body,  
